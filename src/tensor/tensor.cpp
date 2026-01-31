@@ -181,7 +181,7 @@ bool Tensor::isContiguous() const {
         // 检查当前维度的步长是否符合预期
         if (this->strides()[dim_idx] != static_cast<ptrdiff_t>(expected_stride)) {
             return false;
-        } 
+        }
         // 更新期望的步长
         expected_stride *= this->shape()[dim_idx];
     }
@@ -290,6 +290,11 @@ tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
 }
 
 void Tensor::load(const void *src_) {
+    // 添加对存储的空指针检查
+    if (!_storage) {
+        throw std::runtime_error("Tensor storage is not initialized");
+    }
+    
     // 获取张量所需的总字节数
     size_t total_bytes = this->numel() * this->elementSize();
     
