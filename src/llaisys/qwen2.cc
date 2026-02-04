@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iostream>
 #include <algorithm>
+#include <string>
 
 // 实际的模型实现结构体
 struct LlaisysQwen2Model {
@@ -527,6 +528,227 @@ __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen
         return nullptr;
     }
     return &(model->weights);
+}
+
+// 辅助函数：将权重名称映射到具体的权重位置
+static bool map_weight_to_location(LlaisysQwen2Model* model, 
+                                  const std::string& weight_name,
+                                  llaisysTensor_t*& target_tensor,
+                                  size_t* layer_idx = nullptr) {
+    
+    // 1. 嵌入层权重
+    if (weight_name == "model.embed_tokens.weight" || 
+        weight_name == "tok_embeddings.weight" ||
+        weight_name == "tok_embeddings") {
+        target_tensor = &(model->weights.in_embed);
+        return true;
+    }
+    
+    // 2. 输出层权重
+    if (weight_name == "lm_head.weight" || 
+        weight_name == "output.weight" ||
+        weight_name == "output") {
+        target_tensor = &(model->weights.out_embed);
+        return true;
+    }
+    
+    // 3. 输出归一化层
+    if (weight_name == "model.norm.weight" || 
+        weight_name == "norm.weight" ||
+        weight_name == "norm") {
+        target_tensor = &(model->weights.out_norm_w);
+        return true;
+    }
+    
+    // 4. 处理层权重（需要提取层号）
+    std::string pattern;
+    size_t layer_id = 0;
+    
+    // 尝试匹配层权重模式
+    if (weight_name.find("model.layers.") != std::string::npos) {
+        // 格式: model.layers.{layer}.{weight_name}
+        std::string prefix = "model.layers.";
+        size_t start = weight_name.find(prefix) + prefix.length();
+        size_t end = weight_name.find('.', start);
+        
+        if (end != std::string::npos) {
+            std::string layer_str = weight_name.substr(start, end - start);
+            try {
+                layer_id = std::stoi(layer_str);
+                pattern = weight_name.substr(end + 1);  // weight_name after layer
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+    
+    // 检查层号是否有效
+    if (layer_id >= model->meta.nlayer) {
+        std::cerr << "[ERROR] Layer index " << layer_id << " out of range (max=" 
+                  << model->meta.nlayer << ")" << std::endl;
+        return false;
+    }
+    
+    if (layer_idx) *layer_idx = layer_id;
+    
+    // 5. 映射权重名称
+    if (pattern.find("input_layernorm.weight") != std::string::npos ||
+        pattern == "attention_norm.weight") {
+        target_tensor = &(model->weights.attn_norm_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("self_attn.q_proj.weight") != std::string::npos ||
+             pattern.find("attention.wq.weight") != std::string::npos) {
+        target_tensor = &(model->weights.attn_q_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("self_attn.k_proj.weight") != std::string::npos ||
+             pattern.find("attention.wk.weight") != std::string::npos) {
+        target_tensor = &(model->weights.attn_k_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("self_attn.v_proj.weight") != std::string::npos ||
+             pattern.find("attention.wv.weight") != std::string::npos) {
+        target_tensor = &(model->weights.attn_v_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("self_attn.o_proj.weight") != std::string::npos ||
+             pattern.find("attention.wo.weight") != std::string::npos) {
+        target_tensor = &(model->weights.attn_o_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("post_attention_layernorm.weight") != std::string::npos ||
+             pattern.find("ffn_norm.weight") != std::string::npos) {
+        target_tensor = &(model->weights.mlp_norm_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("mlp.gate_proj.weight") != std::string::npos ||
+             pattern.find("feed_forward.w1.weight") != std::string::npos) {
+        target_tensor = &(model->weights.mlp_gate_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("mlp.up_proj.weight") != std::string::npos ||
+             pattern.find("feed_forward.w3.weight") != std::string::npos) {
+        target_tensor = &(model->weights.mlp_up_w[layer_id]);
+        return true;
+    }
+    else if (pattern.find("mlp.down_proj.weight") != std::string::npos ||
+             pattern.find("feed_forward.w2.weight") != std::string::npos) {
+        target_tensor = &(model->weights.mlp_down_w[layer_id]);
+        return true;
+    }
+    
+    return false;
+}
+
+// 主加载函数
+__export bool llaisysQwen2ModelLoadWeight(
+    struct LlaisysQwen2Model* model,
+    const char* weight_name,
+    const void* data,
+    const size_t* shape,
+    size_t ndim,
+    int dtype) {
+    
+    if (!model || !weight_name || !data) {
+        std::cerr << "[ERROR] Invalid parameters to llaisysQwen2ModelLoadWeight" << std::endl;
+        return false;
+    }
+    
+    std::string name_str(weight_name);
+    std::cout << "[LOAD] Loading weight: " << name_str 
+              << ", dtype=" << dtype 
+              << ", ndim=" << ndim << std::endl;
+    
+    // 打印形状信息
+    std::cout << "  Shape: [";
+    for (size_t i = 0; i < ndim; i++) {
+        std::cout << shape[i];
+        if (i < ndim - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    
+    try {
+        // 1. 映射权重名称到具体位置
+        llaisysTensor_t* target_tensor = nullptr;
+        size_t layer_idx = 0;
+        
+        if (!map_weight_to_location(model, name_str, target_tensor, &layer_idx)) {
+            std::cerr << "[ERROR] Could not map weight name: " << name_str << std::endl;
+            return false;
+        }
+        
+        // 2. 检查数据类型是否匹配
+        llaisysDataType_t  target_dtype = static_cast<llaisysDataType_t>(dtype);
+        if (target_dtype != model->meta.dtype) {
+            std::cout << "[WARN] Data type mismatch: weight=" << target_dtype 
+                      << ", model=" << model->meta.dtype 
+                      << ", converting..." << std::endl;
+            
+            // 这里需要实现类型转换逻辑
+            // 暂时只支持相同类型或float32->float16转换
+        }
+        
+        // 3. 创建张量
+        llaisysTensor_t new_tensor = tensorCreate(
+            const_cast<size_t*>(shape), ndim, target_dtype, 
+            model->device_type, model->device_id
+        );
+        
+        if (!new_tensor) {
+            std::cerr << "[ERROR] Failed to create tensor for weight: " << name_str << std::endl;
+            return false;
+        }
+        
+        // 4. 复制数据
+        size_t data_size = 1;
+        for (size_t i = 0; i < ndim; i++) {
+            data_size *= shape[i];
+        }
+        
+        // 计算字节大小
+        size_t elem_size = 0;
+        switch (target_dtype) {
+            case LLAISYS_DTYPE_F32: elem_size = 4; break;
+            case LLAISYS_DTYPE_F16: elem_size = 2; break;
+            case LLAISYS_DTYPE_BF16: elem_size = 2; break;
+            default: elem_size = 4; break;
+        }
+        
+        size_t total_bytes = data_size * elem_size;
+        
+        // 获取张量数据指针
+        void* tensor_data = tensorGetData(new_tensor);
+        if (!tensor_data) {
+            std::cerr << "[ERROR] Failed to get tensor data pointer" << std::endl;
+            tensorDestroy(new_tensor);
+            return false;
+        }
+        
+        // 复制数据
+        memcpy(tensor_data, data, total_bytes);
+        
+        std::cout << "  ✓ Data copied: " << total_bytes << " bytes" << std::endl;
+        
+        // 5. 替换旧的张量（如果存在）
+        if (*target_tensor) {
+            std::cout << "  Replacing existing tensor..." << std::endl;
+            tensorDestroy(*target_tensor);
+        }
+        
+        *target_tensor = new_tensor;
+        std::cout << "  ✓ Weight loaded successfully" << std::endl;
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Exception loading weight " << weight_name 
+                  << ": " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "[ERROR] Unknown exception loading weight " << weight_name << std::endl;
+        return false;
+    }
 }
 
 // 推理函数 - 完整实现

@@ -40,5 +40,7 @@ __C {
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
 
     __export void llaisysQwen2ModelReset(struct LlaisysQwen2Model * model);
+    
+    __export bool llaisysQwen2ModelLoadWeight(struct LlaisysQwen2Model* model,const char* weight_name,const void* data,const size_t* shape,size_t ndim,int dtype);
 }
 #endif // LLAISYS_MODELS_QWEN2_H
