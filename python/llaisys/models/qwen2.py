@@ -160,8 +160,6 @@ class Qwen2:
     
     def _load_all_weights(self, model_path: Path):
         """加载所有权重文件到C++后端"""
-        import safetensors
-        
         # 找到所有safetensors文件
         weight_files = list(model_path.glob("*.safetensors"))
         if not weight_files:
@@ -171,43 +169,132 @@ class Qwen2:
         
         # 加载每个文件
         for file_path in weight_files:
-            self._load_weight_file(file_path)
+            self._load_safetensors_file(file_path)
     
-    def _load_weight_file(self, file_path: Path):
-        """加载单个权重文件到C++后端"""
-        import safetensors
+    def _load_safetensors_file(self, file_path: Path):
+        """加载单个safetensors文件"""
+        import json
+        import struct
         
-        print(f"  Loading {file_path.name}...")
+        print(f"  加载 {file_path.name}...")
         
-        with safetensors.safe_open(str(file_path), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                try:
-                    np_array = f.get_tensor(key).numpy()
-                    
-                    # 添加更多数据类型验证和转换
-                    if np_array.dtype in [np.float16, np.bfloat16]:
-                        # 转换为float32以避免C++后端数据类型错误
-                        np_array = np_array.astype(np.float32)
-                    elif np_array.dtype == np.int64:
-                        # 某些整数类型可能需要转换为int32
-                        np_array = np_array.astype(np.int32)
-                    elif np_array.dtype not in [np.float32, np.int32, np.int8, np.uint8]:
-                        # 确保C++后端支持的数据类型
-                        print(f"    Converting {key} from {np_array.dtype} to supported type")
-                        if np.issubdtype(np_array.dtype, np.floating):
-                            np_array = np_array.astype(np.float32)
-                        elif np.issubdtype(np_array.dtype, np.integer):
-                            np_array = np_array.astype(np.int32)
-                    
-                    success = self._native.load_weight(key, np_array)
-                    
-                    if not success:
-                        print(f"    Warning: Failed to load weight {key}")
-                    else:
-                        print(f"    Loaded: {key} {np_array.shape}")
+        try:
+            with open(file_path, 'rb') as f:
+                # 1. 读取头部大小（8字节，小端序）
+                header_size_bytes = f.read(8)
+                if len(header_size_bytes) < 8:
+                    raise ValueError("文件太小")
+                
+                header_size = struct.unpack('<Q', header_size_bytes)[0]
+                
+                # 2. 读取JSON头部
+                header_bytes = f.read(header_size)
+                header_str = header_bytes.decode('utf-8')
+                header = json.loads(header_str)
+                
+                # 删除元数据部分
+                if '__metadata__' in header:
+                    del header['__metadata__']
+                
+                print(f"    找到 {len(header)} 个张量")
+                
+                # 3. 加载每个张量
+                loaded_count = 0
+                for tensor_name, tensor_info in header.items():
+                    try:
+                        # 获取张量信息
+                        dtype_str = tensor_info['dtype']
+                        shape = tuple(tensor_info['shape'])
+                        data_offsets = tensor_info['data_offsets']
                         
-                except Exception as e:
-                    print(f"    Error loading {key}: {e}")
+                        # 4. 读取原始数据
+                        data_start = data_offsets[0] + 8 + header_size
+                        data_end = data_offsets[1] + 8 + header_size
+                        data_size = data_end - data_start
+                        
+                        f.seek(data_start)
+                        raw_data = f.read(data_size)
+                        
+                        # 5. 解析为numpy数组
+                        np_array = self._parse_raw_data(raw_data, dtype_str, shape)
+                        
+                        if np_array is not None:
+                            # 6. 转换数据类型为float32
+                            final_array = self._convert_to_float32(np_array, dtype_str)
+                            
+                            # 7. 传递给C++后端
+                            success = self._native.load_weight(tensor_name, final_array)
+                            
+                            if success:
+                                loaded_count += 1
+                                print(f"    ✓ {tensor_name}: {shape}, {dtype_str}->float32")
+                            else:
+                                print(f"    ✗ {tensor_name}: 加载失败")
+                        
+                    except Exception as e:
+                        print(f"    ✗ {tensor_name}: 错误 - {str(e)[:50]}")
+                
+                print(f"    完成: {loaded_count}/{len(header)} 个张量加载成功")
+                
+        except Exception as e:
+            print(f"  错误加载 {file_path.name}: {e}")
+
+    def _parse_raw_data(self, raw_data, dtype_str, shape):
+        """解析原始二进制数据为numpy数组"""
+        try:
+            # 计算总元素数
+            total_elements = 1
+            for dim in shape:
+                total_elements *= dim
+            
+            # 根据数据类型解析
+            if dtype_str == 'F32':
+                # float32
+                return np.frombuffer(raw_data, dtype=np.float32).reshape(shape)
+            elif dtype_str == 'F16':
+                # float16
+                return np.frombuffer(raw_data, dtype=np.float16).astype(np.float32).reshape(shape)
+            elif dtype_str == 'BF16':
+                # bfloat16 - 需要特殊处理
+                bf16_data = np.frombuffer(raw_data, dtype=np.uint16).reshape(shape)
+                # Convert bfloat16 to float32 using numpy's casting
+                return bf16_data.view(np.float32)
+            elif dtype_str == 'I32':
+                # int32
+                return np.frombuffer(raw_data, dtype=np.int32).reshape(shape)
+            elif dtype_str == 'I64':
+                # int64 -> 转int32
+                int64_data = np.frombuffer(raw_data, dtype=np.int64).reshape(shape)
+                return int64_data.astype(np.int32)
+            else:
+                print(f"      不支持的数据类型: {dtype_str}")
+                return None
+                
+        except Exception as e:
+            print(f"      解析错误: {e}")
+            return None
+
+    def _convert_to_float32(self, np_array, dtype_str):
+        """将数组转换为float32"""
+        if np_array.dtype == np.float32:
+            return np_array
+        
+        # 转换策略
+        if dtype_str in ['F16', 'BF16']:
+            # 半精度 -> float32
+            return np_array.astype(np.float32)
+        elif dtype_str in ['I32', 'I64', 'I16', 'I8']:
+            # 整数 -> float32
+            return np_array.astype(np.float32)
+        elif dtype_str == 'U8':
+            # uint8 -> float32 (归一化)
+            return np_array.astype(np.float32) / 255.0
+        else:
+            # 其他类型尝试转换
+            try:
+                return np_array.astype(np.float32)
+            except:
+                return np_array
     
     def generate(
         self,
