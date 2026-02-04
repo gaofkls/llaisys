@@ -189,112 +189,112 @@ class Qwen2Native:
         self.meta = None
     
     def create(self, config: dict) -> bool:
-    """创建C++模型实例 - 修复数据类型问题"""
-    try:
-        from ..libllaisys.qwen2 import LlaisysQwen2Meta
-        from ctypes import c_float
-        
-        meta = LlaisysQwen2Meta()
-        
-        # 1. 填充基本字段
-        meta.nlayer = config.get('num_hidden_layers', 28)
-        meta.nh = config.get('num_attention_heads', 12)
-        meta.nkvh = config.get('num_key_value_heads', 2)
-        meta.hs = config.get('hidden_size', 1536)
-        meta.dh = meta.hs // meta.nh if meta.nh > 0 else 128
-        
-        meta.maxseq = config.get('max_position_embeddings', 131072)
-        meta.voc = config.get('vocab_size', 151936)
-        
-        # 2. ========== 关键修复：正确设置dtype ==========
-        torch_dtype = config.get('torch_dtype', 'bfloat16')
-        print(f"[DEBUG] Original torch_dtype from config: {torch_dtype}")
-        
-        # 方法1：尝试使用枚举常量（如果可用）
+        """创建C++模型实例 - 修复数据类型问题"""
         try:
-            # 导入枚举常量
-            from ..libllaisys.qwen2 import (
-                LLAISYS_DTYPE_BF16, 
-                LLAISYS_DTYPE_F16, 
-                LLAISYS_DTYPE_F32
+            from ..libllaisys.qwen2 import LlaisysQwen2Meta
+            from ctypes import c_float
+            
+            meta = LlaisysQwen2Meta()
+            
+            # 1. 填充基本字段
+            meta.nlayer = config.get('num_hidden_layers', 28)
+            meta.nh = config.get('num_attention_heads', 12)
+            meta.nkvh = config.get('num_key_value_heads', 2)
+            meta.hs = config.get('hidden_size', 1536)
+            meta.dh = meta.hs // meta.nh if meta.nh > 0 else 128
+            
+            meta.maxseq = config.get('max_position_embeddings', 131072)
+            meta.voc = config.get('vocab_size', 151936)
+            
+            # 2. ========== 关键修复：正确设置dtype ==========
+            torch_dtype = config.get('torch_dtype', 'bfloat16')
+            print(f"[DEBUG] Original torch_dtype from config: {torch_dtype}")
+            
+            # 方法1：尝试使用枚举常量（如果可用）
+            try:
+                # 导入枚举常量
+                from ..libllaisys.qwen2 import (
+                    LLAISYS_DTYPE_BF16, 
+                    LLAISYS_DTYPE_F16, 
+                    LLAISYS_DTYPE_F32
+                )
+                
+                if torch_dtype == 'bfloat16':
+                    meta.dtype = LLAISYS_DTYPE_BF16
+                    print(f"[INFO] Using enum: LLAISYS_DTYPE_BF16 = {LLAISYS_DTYPE_BF16}")
+                elif torch_dtype == 'float16':
+                    meta.dtype = LLAISYS_DTYPE_F16
+                    print(f"[INFO] Using enum: LLAISYS_DTYPE_F16 = {LLAISYS_DTYPE_F16}")
+                elif torch_dtype == 'float32':
+                    meta.dtype = LLAISYS_DTYPE_F32
+                    print(f"[INFO] Using enum: LLAISYS_DTYPE_F32 = {LLAISYS_DTYPE_F32}")
+                else:
+                    print(f"[WARN] Unknown dtype {torch_dtype}, defaulting to float32")
+                    meta.dtype = LLAISYS_DTYPE_F32
+                    
+            except ImportError:
+                # 方法2：如果枚举不可用，使用整数值
+                print("[WARN] Enum constants not available, using integer values")
+                
+                dtype_map = {
+                    'bfloat16': 19,  # LLAISYS_DTYPE_BF16
+                    'float16': 12,   # LLAISYS_DTYPE_F16
+                    'float32': 13,   # LLAISYS_DTYPE_F32
+                    'float64': 14,   # LLAISYS_DTYPE_F64
+                }
+                
+                if torch_dtype in dtype_map:
+                    meta.dtype = dtype_map[torch_dtype]
+                    print(f"[INFO] Using integer: {torch_dtype} -> {meta.dtype}")
+                else:
+                    print(f"[WARN] Unknown dtype {torch_dtype}, using float32 (13)")
+                    meta.dtype = 13  # LLAISYS_DTYPE_F32
+            
+            # 3. 强制使用float32（如果bfloat16有问题）
+            # 临时修复：如果之前bfloat16失败，强制使用float32
+            force_float32 = True  # 设置为True来强制使用float32
+            if force_float32 and meta.dtype == 19:  # 如果是bfloat16
+                print("[FORCE] Changing bfloat16 (19) to float32 (13) for compatibility")
+                meta.dtype = 13  # LLAISYS_DTYPE_F32
+            
+            print(f"[DEBUG] Final dtype value: {meta.dtype}")
+            
+            # 4. 其他参数
+            meta.theta = c_float(config.get('rope_theta', 10000.0))
+            meta.epsilon = c_float(config.get('rms_norm_eps', 1e-6))
+            
+            # 5. 打印调试信息
+            print(f"[DEBUG] Model meta for C++:")
+            print(f"  nlayer={meta.nlayer}, nh={meta.nh}, nkvh={meta.nkvh}")
+            print(f"  hs={meta.hs}, dh={meta.dh}, voc={meta.voc}")
+            print(f"  maxseq={meta.maxseq}, dtype={meta.dtype}")
+            print(f"  theta={meta.theta}, epsilon={meta.epsilon}")
+            
+            # 6. 调用C++函数
+            device_type = 0  # CPU
+            device_ids = None
+            ndevice = 0
+            
+            print(f"[DEBUG] Calling C++ llaisysQwen2ModelCreate...")
+            self.model_ptr = LIB_LLAISYS.llaisysQwen2ModelCreate(
+                meta, 
+                device_type,
+                device_ids,
+                ndevice
             )
             
-            if torch_dtype == 'bfloat16':
-                meta.dtype = LLAISYS_DTYPE_BF16
-                print(f"[INFO] Using enum: LLAISYS_DTYPE_BF16 = {LLAISYS_DTYPE_BF16}")
-            elif torch_dtype == 'float16':
-                meta.dtype = LLAISYS_DTYPE_F16
-                print(f"[INFO] Using enum: LLAISYS_DTYPE_F16 = {LLAISYS_DTYPE_F16}")
-            elif torch_dtype == 'float32':
-                meta.dtype = LLAISYS_DTYPE_F32
-                print(f"[INFO] Using enum: LLAISYS_DTYPE_F32 = {LLAISYS_DTYPE_F32}")
-            else:
-                print(f"[WARN] Unknown dtype {torch_dtype}, defaulting to float32")
-                meta.dtype = LLAISYS_DTYPE_F32
-                
-        except ImportError:
-            # 方法2：如果枚举不可用，使用整数值
-            print("[WARN] Enum constants not available, using integer values")
+            if self.model_ptr is None:
+                print("[ERROR] C++ create returned nullptr")
+                return False
             
-            dtype_map = {
-                'bfloat16': 19,  # LLAISYS_DTYPE_BF16
-                'float16': 12,   # LLAISYS_DTYPE_F16
-                'float32': 13,   # LLAISYS_DTYPE_F32
-                'float64': 14,   # LLAISYS_DTYPE_F64
-            }
+            print(f"[DEBUG] C++ create succeeded, model_ptr={self.model_ptr}")
+            return True
             
-            if torch_dtype in dtype_map:
-                meta.dtype = dtype_map[torch_dtype]
-                print(f"[INFO] Using integer: {torch_dtype} -> {meta.dtype}")
-            else:
-                print(f"[WARN] Unknown dtype {torch_dtype}, using float32 (13)")
-                meta.dtype = 13  # LLAISYS_DTYPE_F32
-        
-        # 3. 强制使用float32（如果bfloat16有问题）
-        # 临时修复：如果之前bfloat16失败，强制使用float32
-        force_float32 = True  # 设置为True来强制使用float32
-        if force_float32 and meta.dtype == 19:  # 如果是bfloat16
-            print("[FORCE] Changing bfloat16 (19) to float32 (13) for compatibility")
-            meta.dtype = 13  # LLAISYS_DTYPE_F32
-        
-        print(f"[DEBUG] Final dtype value: {meta.dtype}")
-        
-        # 4. 其他参数
-        meta.theta = c_float(config.get('rope_theta', 10000.0))
-        meta.epsilon = c_float(config.get('rms_norm_eps', 1e-6))
-        
-        # 5. 打印调试信息
-        print(f"[DEBUG] Model meta for C++:")
-        print(f"  nlayer={meta.nlayer}, nh={meta.nh}, nkvh={meta.nkvh}")
-        print(f"  hs={meta.hs}, dh={meta.dh}, voc={meta.voc}")
-        print(f"  maxseq={meta.maxseq}, dtype={meta.dtype}")
-        print(f"  theta={meta.theta}, epsilon={meta.epsilon}")
-        
-        # 6. 调用C++函数
-        device_type = 0  # CPU
-        device_ids = None
-        ndevice = 0
-        
-        print(f"[DEBUG] Calling C++ llaisysQwen2ModelCreate...")
-        self._model_ptr = self._create(
-            meta, 
-            device_type,
-            device_ids,
-            ndevice
-        )
-        
-        if self._model_ptr is None:
-            print("[ERROR] C++ create returned nullptr")
+        except Exception as e:
+            print(f"[ERROR] create() failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
-        
-        print(f"[DEBUG] C++ create succeeded, model_ptr={self._model_ptr}")
-        return True
-        
-    except Exception as e:
-        print(f"[ERROR] create() failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
     
     def destroy(self):
         """销毁C++模型"""
