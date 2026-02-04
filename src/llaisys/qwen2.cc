@@ -73,7 +73,6 @@ struct LlaisysQwen2Model {
     
     LlaisysQwen2Model(const LlaisysQwen2Meta& m, llaisysDeviceType_t dev_type, int* dev_ids, int ndevice)
         : meta(m), current_seq_len(0), device_type(dev_type), device_id(0), pos_ids(nullptr) {
-        
         if (dev_ids && ndevice > 0) {
             device_id = dev_ids[0];
         }
