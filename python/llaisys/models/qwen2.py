@@ -37,6 +37,108 @@ class Qwen2:
         with open(config_file, 'r', encoding='utf-8') as f:
             self.config = json.load(f)
         
+        # 诊断代码块 - 应该移除或作为单独函数存在
+        print("=" * 60)
+        print("立即诊断：检查C++后端问题")
+        print("=" * 60)
+        
+        # 1. 检查C++库
+        print("\n1. 检查C++库...")
+        try:
+            # 检查LIB_LLAISYS是否已加载
+            if LIB_LLAISYS is None:
+                print("  ✗ LIB_LLAISYS is None")
+            else:
+                print(f"  ✓ LIB_LLAISYS 对象: {type(LIB_LLAISYS)}")
+                
+                # 检查关键函数是否存在
+                key_functions = [
+                    'llaisysQwen2ModelCreate',
+                    'llaisysQwen2ModelDestroy',
+                    'llaisysQwen2ModelLoadWeight',
+                    'llaisysQwen2ModelInfer',
+                    'llaisysQwen2ModelReset'
+                ]
+                
+                for func_name in key_functions:
+                    if hasattr(LIB_LLAISYS, func_name):
+                        func = getattr(LIB_LLAISYS, func_name)
+                        print(f"  ✓ {func_name}: {hex(id(func)) if func else 'None'}")
+                    else:
+                        print(f"  ✗ 缺少函数: {func_name}")
+                        
+        except Exception as e:
+            print(f"  ✗ 检查C++库时出错: {e}")
+        
+        # 2. 检查配置
+        print("\n2. 检查配置...")
+        print(f"  配置类型: {type(self.config)}")
+        print(f"  配置内容前5项:")
+        for i, (key, value) in enumerate(list(self.config.items())[:5]):
+            print(f"    {key}: {value}")
+        
+        # 检查必需字段
+        required_fields = [
+            'num_hidden_layers',
+            'hidden_size', 
+            'num_attention_heads',
+            'vocab_size',
+            'max_position_embeddings'
+        ]
+        
+        for field in required_fields:
+            if field in self.config:
+                print(f"  ✓ {field}: {self.config[field]}")
+            else:
+                print(f"  ✗ 缺少必需字段: {field}")
+        
+        # 3. 尝试导入C结构体
+        print("\n3. 检查C结构体导入...")
+        try:
+            # 尝试导入LlaisysQwen2Meta
+            from ..libllaisys.qwen2 import LlaisysQwen2Meta
+            
+            # 创建一个测试实例
+            test_meta = LlaisysQwen2Meta()
+            print(f"  ✓ 可以创建 LlaisysQwen2Meta")
+            
+            # 尝试设置字段
+            test_meta.nlayer = 24
+            test_meta.nh = 32
+            test_meta.hs = 2048
+            print(f"  ✓ 可以设置结构体字段")
+            
+        except ImportError as e:
+            print(f"  ✗ 无法导入 LlaisysQwen2Meta: {e}")
+        except Exception as e:
+            print(f"  ✗ 创建结构体时出错: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 4. 检查数据类型配置
+        print("\n4. 检查数据类型...")
+        torch_dtype = self.config.get('torch_dtype', 'unknown')
+        print(f"  torch_dtype: {torch_dtype}")
+        
+        # 5. 打印完整配置（调试用）
+        print("\n5. 完整配置摘要:")
+        for key in sorted(self.config.keys()):
+            value = self.config[key]
+            if isinstance(value, (int, float, str, bool)):
+                print(f"  {key}: {value}")
+            elif isinstance(value, list) and len(value) <= 3:
+                print(f"  {key}: {value}")
+            else:
+                print(f"  {key}: {type(value)}")
+        
+        print("\n" + "=" * 60)
+        print("诊断完成")
+        print("=" * 60 + "\n")
+        
+        ##################################################################
+        # === 立即诊断代码到这里结束 ===
+        ##################################################################    
+            
         # 2. 创建C++模型
         self._native = Qwen2Native()
         if not self._native.create(self.config):
