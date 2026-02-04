@@ -95,6 +95,28 @@ target("llaisys-ops")
     on_install(function (target) end)
 target_end()
 
+-- Qwen2 模型实现（只需要这一个新目标）
+target("llaisys-models-qwen2")
+    set_kind("static")
+    add_deps("llaisys-tensor")
+    add_deps("llaisys-ops")
+    
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    end
+    
+    add_files("src/llaisys/qwen2.cc")
+    
+    -- 包含路径（使用现有的）
+    add_includedirs("include")
+    add_includedirs("src")
+    
+    on_install(function (target) end)
+target_end()
+
+-- 主llaisys目标（注意：只有一个target("llaisys")定义！）
 target("llaisys")
     set_kind("shared")
     add_deps("llaisys-utils")
@@ -102,12 +124,12 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
+    add_deps("llaisys-models-qwen2")  -- 添加Qwen2模型依赖
 
     set_languages("cxx17")
     set_warnings("all", "error")
     add_files("src/llaisys/*.cc")
     set_installdir(".")
-
     
     after_install(function (target)
         -- copy shared library to python package
