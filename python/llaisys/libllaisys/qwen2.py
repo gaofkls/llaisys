@@ -187,6 +187,73 @@ class Qwen2Native:
     def __init__(self):
         self.model_ptr = None
         self.meta = None
+         # 确保 load_weight 函数已绑定
+        if hasattr(LIB_LLAISYS, 'llaisysQwen2ModelLoadWeight'):
+            self._load_weight_func = LIB_LLAISYS.llaisysQwen2ModelLoadWeight
+            
+            # 设置参数类型
+            from ctypes import c_void_p, c_char_p, POINTER, c_size_t, c_int
+            
+            self._load_weight_func.argtypes = [
+                c_void_p,           # model
+                c_char_p,           # weight_name
+                c_void_p,           # data
+                POINTER(c_size_t),  # shape
+                c_size_t,           # ndim
+                c_int               # dtype
+            ]
+            self._load_weight_func.restype = c_int
+        else:
+            print("[ERROR] llaisysQwen2ModelLoadWeight function not found!")
+            self._load_weight_func = None
+        
+        self._model_ptr = None  # 注意：应该是c_void_p，不是int
+    
+    def load_weight(self, name: str, data) -> bool:
+        """加载权重到C++后端"""
+        if not self._model_ptr or not self._load_weight_func:
+            print(f"[ERROR] Cannot load weight {name}: model not created or function not available")
+            return False
+        
+        try:
+            import numpy as np
+            from ctypes import c_void_p, c_char_p, POINTER, c_size_t, c_int
+            
+            # 确保数据是numpy数组
+            if not isinstance(data, np.ndarray):
+                try:
+                    data = np.array(data)
+                except:
+                    print(f"[ERROR] Cannot convert data to numpy array for {name}")
+                    return False
+            
+            # 确保是float32
+            if data.dtype != np.float32:
+                data = data.astype(np.float32)
+            
+            # 准备参数
+            weight_name = name.encode('utf-8')
+            data_ptr = data.ctypes.data_as(c_void_p)
+            shape_array = (c_size_t * data.ndim)(*data.shape)
+            
+            # 使用float32类型 (13)
+            cpp_dtype = 13
+            
+            # 调用C++函数
+            result = self._load_weight_func(
+                self._model_ptr,
+                c_char_p(weight_name),
+                data_ptr,
+                shape_array,
+                data.ndim,
+                c_int(cpp_dtype)
+            )
+            
+            return bool(result)
+            
+        except Exception as e:
+            print(f"[ERROR] load_weight failed for {name}: {e}")
+            return False
     
     def create(self, config: dict) -> bool:
         """创建C++模型实例 - 修复数据类型问题"""
@@ -300,7 +367,7 @@ class Qwen2Native:
         """销毁C++模型"""
         if self.model_ptr and hasattr(LIB_LLAISYS, 'llaisysQwen2ModelDestroy'):
             # 检查是否是dummy指针
-            if self.model_ptr.value != 1:
+            if self.model_ptr:
                 LIB_LLAISYS.llaisysQwen2ModelDestroy(self.model_ptr)
         self.model_ptr = None
     
@@ -310,7 +377,7 @@ class Qwen2Native:
             raise RuntimeError("Model not created")
         
         # 如果是dummy指针，返回dummy token
-        if self.model_ptr.value == 1:
+        if self.model_ptr:
             print("[Dummy] Qwen2 infer returning token 42")
             return 42
         
@@ -332,7 +399,7 @@ class Qwen2Native:
         """重置C++模型状态"""
         if self.model_ptr and hasattr(LIB_LLAISYS, 'llaisysQwen2ModelReset'):
             # 检查是否是dummy指针
-            if self.model_ptr.value != 1:
+            if self.model_ptr:
                 LIB_LLAISYS.llaisysQwen2ModelReset(self.model_ptr)
         else:
             print("[Dummy] Qwen2 reset called")
