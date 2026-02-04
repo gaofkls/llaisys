@@ -36,108 +36,6 @@ class Qwen2:
         
         with open(config_file, 'r', encoding='utf-8') as f:
             self.config = json.load(f)
-        
-        # 诊断代码块 - 应该移除或作为单独函数存在
-        print("=" * 60)
-        print("立即诊断：检查C++后端问题")
-        print("=" * 60)
-        
-        # 1. 检查C++库
-        print("\n1. 检查C++库...")
-        try:
-            # 检查LIB_LLAISYS是否已加载
-            if LIB_LLAISYS is None:
-                print("  ✗ LIB_LLAISYS is None")
-            else:
-                print(f"  ✓ LIB_LLAISYS 对象: {type(LIB_LLAISYS)}")
-                
-                # 检查关键函数是否存在
-                key_functions = [
-                    'llaisysQwen2ModelCreate',
-                    'llaisysQwen2ModelDestroy',
-                    'llaisysQwen2ModelLoadWeight',
-                    'llaisysQwen2ModelInfer',
-                    'llaisysQwen2ModelReset'
-                ]
-                
-                for func_name in key_functions:
-                    if hasattr(LIB_LLAISYS, func_name):
-                        func = getattr(LIB_LLAISYS, func_name)
-                        print(f"  ✓ {func_name}: {hex(id(func)) if func else 'None'}")
-                    else:
-                        print(f"  ✗ 缺少函数: {func_name}")
-                        
-        except Exception as e:
-            print(f"  ✗ 检查C++库时出错: {e}")
-        
-        # 2. 检查配置
-        print("\n2. 检查配置...")
-        print(f"  配置类型: {type(self.config)}")
-        print(f"  配置内容前5项:")
-        for i, (key, value) in enumerate(list(self.config.items())[:5]):
-            print(f"    {key}: {value}")
-        
-        # 检查必需字段
-        required_fields = [
-            'num_hidden_layers',
-            'hidden_size', 
-            'num_attention_heads',
-            'vocab_size',
-            'max_position_embeddings'
-        ]
-        
-        for field in required_fields:
-            if field in self.config:
-                print(f"  ✓ {field}: {self.config[field]}")
-            else:
-                print(f"  ✗ 缺少必需字段: {field}")
-        
-        # 3. 尝试导入C结构体
-        print("\n3. 检查C结构体导入...")
-        try:
-            # 尝试导入LlaisysQwen2Meta
-            from ..libllaisys.qwen2 import LlaisysQwen2Meta
-            
-            # 创建一个测试实例
-            test_meta = LlaisysQwen2Meta()
-            print(f"  ✓ 可以创建 LlaisysQwen2Meta")
-            
-            # 尝试设置字段
-            test_meta.nlayer = 24
-            test_meta.nh = 32
-            test_meta.hs = 2048
-            print(f"  ✓ 可以设置结构体字段")
-            
-        except ImportError as e:
-            print(f"  ✗ 无法导入 LlaisysQwen2Meta: {e}")
-        except Exception as e:
-            print(f"  ✗ 创建结构体时出错: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 4. 检查数据类型配置
-        print("\n4. 检查数据类型...")
-        torch_dtype = self.config.get('torch_dtype', 'unknown')
-        print(f"  torch_dtype: {torch_dtype}")
-        
-        # 5. 打印完整配置（调试用）
-        print("\n5. 完整配置摘要:")
-        for key in sorted(self.config.keys()):
-            value = self.config[key]
-            if isinstance(value, (int, float, str, bool)):
-                print(f"  {key}: {value}")
-            elif isinstance(value, list) and len(value) <= 3:
-                print(f"  {key}: {value}")
-            else:
-                print(f"  {key}: {type(value)}")
-        
-        print("\n" + "=" * 60)
-        print("诊断完成")
-        print("=" * 60 + "\n")
-        
-        ##################################################################
-        # === 立即诊断代码到这里结束 ===
-        ##################################################################    
             
         # 2. 创建C++模型
         self._native = Qwen2Native()
@@ -172,95 +70,95 @@ class Qwen2:
             self._load_safetensors_file(file_path)
     
     def _load_safetensors_file(self, file_path: Path):
-    """加载单个safetensors文件 - 修复版本"""
-    import numpy as np
-    import json
-    import struct
-    
-    print(f"  加载 {file_path.name}...")
-    
-    try:
-        with open(file_path, 'rb') as f:
-            # 1. 读取头部大小
-            header_size_bytes = f.read(8)
-            if len(header_size_bytes) < 8:
-                print("    文件太小，跳过")
-                return
-            
-            header_size = struct.unpack('<Q', header_size_bytes)[0]
-            
-            # 2. 读取JSON头部
-            header_bytes = f.read(header_size)
-            header_str = header_bytes.decode('utf-8')
-            header = json.loads(header_str)
-            
-            # 删除元数据
-            if '__metadata__' in header:
-                del header['__metadata__']
-            
-            print(f"    找到 {len(header)} 个张量")
-            
-            # 3. 只加载前几个张量用于测试
-            loaded_count = 0
-            max_to_load = 10  # 只加载前10个用于测试
-            
-            for i, (tensor_name, tensor_info) in enumerate(header.items()):
-                if i >= max_to_load:
-                    print(f"    [SKIP] 只加载前{max_to_load}个张量用于测试")
-                    break
+        """加载单个safetensors文件 - 修复版本"""
+        import numpy as np
+        import json
+        import struct
+        
+        print(f"  加载 {file_path.name}...")
+        
+        try:
+            with open(file_path, 'rb') as f:
+                # 1. 读取头部大小
+                header_size_bytes = f.read(8)
+                if len(header_size_bytes) < 8:
+                    print("    文件太小，跳过")
+                    return
                 
-                try:
-                    # 获取张量信息
-                    dtype_str = tensor_info['dtype']
-                    shape = tuple(tensor_info['shape'])
-                    data_offsets = tensor_info['data_offsets']
+                header_size = struct.unpack('<Q', header_size_bytes)[0]
+                
+                # 2. 读取JSON头部
+                header_bytes = f.read(header_size)
+                header_str = header_bytes.decode('utf-8')
+                header = json.loads(header_str)
+                
+                # 删除元数据
+                if '__metadata__' in header:
+                    del header['__metadata__']
+                
+                print(f"    找到 {len(header)} 个张量")
+                
+                # 3. 只加载前几个张量用于测试
+                loaded_count = 0
+                max_to_load = 10  # 只加载前10个用于测试
+                
+                for i, (tensor_name, tensor_info) in enumerate(header.items()):
+                    if i >= max_to_load:
+                        print(f"    [SKIP] 只加载前{max_to_load}个张量用于测试")
+                        break
                     
-                    # 读取原始数据
-                    data_start = data_offsets[0] + 8 + header_size
-                    data_end = data_offsets[1] + 8 + header_size
-                    data_size = data_end - data_start
-                    
-                    f.seek(data_start)
-                    raw_data = f.read(data_size)
-                    
-                    # 检查load_weight方法是否存在
-                    if not hasattr(self._native, 'load_weight'):
-                        print(f"    [ERROR] Qwen2Native没有load_weight方法")
-                        # 临时添加一个虚拟的load_weight方法
-                        self._native.load_weight = self._dummy_load_weight
-                    
-                    # 简化：创建虚拟数据用于测试
-                    print(f"    [TEST] {tensor_name}: {shape}, {dtype_str}")
-                    
-                    # 创建虚拟权重（用于测试）
-                    total_elements = 1
-                    for dim in shape:
-                        total_elements *= dim
-                    
-                    # 创建小的随机权重用于测试
-                    test_data = np.random.randn(*shape).astype(np.float32) * 0.01
-                    
-                    # 加载到C++后端
-                    success = self._native.load_weight(tensor_name, test_data)
-                    
-                    if success:
-                        loaded_count += 1
-                        print(f"      ✓ 测试权重加载成功")
-                    else:
-                        print(f"      ✗ 测试权重加载失败")
-                    
-                except Exception as e:
-                    print(f"    ✗ {tensor_name}: 错误 - {str(e)[:50]}")
-            
-            print(f"    完成: {loaded_count}/{min(max_to_load, len(header))} 个张量加载成功")
-            
-    except Exception as e:
-        print(f"  错误加载 {file_path.name}: {e}")
+                    try:
+                        # 获取张量信息
+                        dtype_str = tensor_info['dtype']
+                        shape = tuple(tensor_info['shape'])
+                        data_offsets = tensor_info['data_offsets']
+                        
+                        # 读取原始数据
+                        data_start = data_offsets[0] + 8 + header_size
+                        data_end = data_offsets[1] + 8 + header_size
+                        data_size = data_end - data_start
+                        
+                        f.seek(data_start)
+                        raw_data = f.read(data_size)
+                        
+                        # 检查load_weight方法是否存在
+                        if not hasattr(self._native, 'load_weight'):
+                            print(f"    [ERROR] Qwen2Native没有load_weight方法")
+                            # 临时添加一个虚拟的load_weight方法
+                            self._native.load_weight = self._dummy_load_weight
+                        
+                        # 简化：创建虚拟数据用于测试
+                        print(f"    [TEST] {tensor_name}: {shape}, {dtype_str}")
+                        
+                        # 创建虚拟权重（用于测试）
+                        total_elements = 1
+                        for dim in shape:
+                            total_elements *= dim
+                        
+                        # 创建小的随机权重用于测试
+                        test_data = np.random.randn(*shape).astype(np.float32) * 0.01
+                        
+                        # 加载到C++后端
+                        success = self._native.load_weight(tensor_name, test_data)
+                        
+                        if success:
+                            loaded_count += 1
+                            print(f"      ✓ 测试权重加载成功")
+                        else:
+                            print(f"      ✗ 测试权重加载失败")
+                        
+                    except Exception as e:
+                        print(f"    ✗ {tensor_name}: 错误 - {str(e)[:50]}")
+                
+                print(f"    完成: {loaded_count}/{min(max_to_load, len(header))} 个张量加载成功")
+                
+        except Exception as e:
+            print(f"  错误加载 {file_path.name}: {e}")
 
-def _dummy_load_weight(self, name, data):
-    """虚拟的load_weight方法（当C++方法不可用时使用）"""
-    print(f"    [DUMMY] 虚拟加载: {name}, shape={data.shape if hasattr(data, 'shape') else 'unknown'}")
-    return True  # 总是返回成功，让程序继续
+    def _dummy_load_weight(self, name, data):
+        """虚拟的load_weight方法（当C++方法不可用时使用）"""
+        print(f"    [DUMMY] 虚拟加载: {name}, shape={data.shape if hasattr(data, 'shape') else 'unknown'}")
+        return True  # 总是返回成功，让程序继续
 
     def _parse_raw_data(self, raw_data, dtype_str, shape):
         """解析原始二进制数据为numpy数组"""
