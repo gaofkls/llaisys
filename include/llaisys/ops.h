@@ -11,6 +11,9 @@ __C {
     __export void llaisysRearrange(llaisysTensor_t out, llaisysTensor_t in);
     __export void llaisysRmsNorm(llaisysTensor_t out, llaisysTensor_t in, llaisysTensor_t weight, float eps);
     __export void llaisysROPE(llaisysTensor_t out, llaisysTensor_t in, llaisysTensor_t pos_ids, float theta);
+    // Draws one token from `vals` (1-D logits). `rng_state` is a caller owned
+    // 64-bit generator state, advanced in place on every call.
+    __export void llaisysSample(llaisysTensor_t token_id, llaisysTensor_t vals, float temperature, size_t top_k, float top_p, uint64_t *rng_state);
     __export void llaisysSelfAttention(llaisysTensor_t attn_val, llaisysTensor_t q, llaisysTensor_t k, llaisysTensor_t v, float scale);
     __export void llaisysSwiGLU(llaisysTensor_t out, llaisysTensor_t gate, llaisysTensor_t up);
 }

@@ -39,6 +39,11 @@ __C {
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
 
+    // Same forward pass, but draws the next token instead of taking the argmax.
+    // `temperature <= 0` or `top_k == 1` falls back to greedy decoding.
+    // `rng_state` is a caller owned 64-bit generator state, advanced in place.
+    __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, float temperature, size_t top_k, float top_p, uint64_t * rng_state);
+
     __export void llaisysQwen2ModelReset(struct LlaisysQwen2Model * model);
     
     __export bool llaisysQwen2ModelLoadWeight(struct LlaisysQwen2Model* model,const char* weight_name,const void* data,const size_t* shape,size_t ndim,int dtype);

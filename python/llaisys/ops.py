@@ -1,6 +1,6 @@
 from .libllaisys import LIB_LLAISYS
 from .tensor import Tensor
-from ctypes import c_float, c_int
+from ctypes import byref, c_float, c_int
 
 
 class Ops:
@@ -19,9 +19,12 @@ class Ops:
         )
 
     @staticmethod
-    def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor):
+    def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor = None):
         LIB_LLAISYS.llaisysLinear(
-            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
+            out.lib_tensor(),
+            inp.lib_tensor(),
+            weight.lib_tensor(),
+            None if bias is None else bias.lib_tensor(),
         )
 
     @staticmethod
@@ -38,6 +41,30 @@ class Ops:
     def rope(out: Tensor, inp: Tensor, pos_ids: Tensor, theta: float):
         LIB_LLAISYS.llaisysROPE(
             out.lib_tensor(), inp.lib_tensor(), pos_ids.lib_tensor(), c_float(theta)
+        )
+
+    @staticmethod
+    def sample(
+        token_id: Tensor,
+        vals: Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        rng_state=None,
+    ):
+        """Draw one token from 1-D logits `vals` into `token_id` (int64, shape (1,)).
+
+        `rng_state` is a `ctypes.c_uint64` owned by the caller; it is advanced in
+        place on every call, so reusing the same object continues the sequence.
+        Passing None lets the backend fall back to a thread-local generator.
+        """
+        LIB_LLAISYS.llaisysSample(
+            token_id.lib_tensor(),
+            vals.lib_tensor(),
+            c_float(temperature),
+            int(top_k),
+            c_float(top_p),
+            None if rng_state is None else byref(rng_state),
         )
 
     @staticmethod

@@ -1,5 +1,6 @@
 #include "tensor.hpp"
 
+#include "copy.hpp"
 #include "../utils.hpp"
 
 #include <cstring>
@@ -164,28 +165,26 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    // 获取维度数
-    size_t ndim = this->ndim();
-    
-    // 如果是0维张量（标量），则认为是连续的
+    const size_t ndim = this->ndim();
     if (ndim == 0) {
         return true;
     }
-    
-    // 从最后一个维度开始向前检查步长
+
+    // Walk from the innermost dimension outwards. Dimensions of extent 1 do not
+    // constrain the layout (their stride is irrelevant), which matches PyTorch.
     ptrdiff_t expected_stride = 1;
-    
     for (size_t i = ndim; i > 0; --i) {
-        size_t dim_idx = i - 1;
-        
-        // 检查当前维度的步长是否符合预期
-        if (this->strides()[dim_idx] != static_cast<ptrdiff_t>(expected_stride)) {
+        const size_t dim_idx = i - 1;
+        const size_t extent = this->shape()[dim_idx];
+        if (extent == 0) {
+            return true;
+        }
+        if (extent != 1 && this->strides()[dim_idx] != expected_stride) {
             return false;
         }
-        // 更新期望的步长
-        expected_stride *= this->shape()[dim_idx];
+        expected_stride *= static_cast<ptrdiff_t>(extent);
     }
-    
+
     return true;
 }
 
@@ -316,18 +315,43 @@ void Tensor::load(const void *src_) {
     }
 }
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (this->isContiguous()) {
+        // Already packed: share the storage instead of copying.
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto packed = Tensor::create(_meta.shape, _meta.dtype, this->deviceType(),
+                                 this->deviceId());
+    copy_strided(packed, std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset)));
+    return packed;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t new_numel = 1;
+    for (size_t dim : shape) {
+        new_numel *= dim;
+    }
+    if (new_numel != this->numel()) {
+        throw std::invalid_argument("reshape: new shape changes the number of elements");
+    }
+
+    auto self = std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    // A packed tensor can be re-viewed for free; otherwise materialise a packed
+    // copy first so the caller still gets the shape it asked for.
+    return this->isContiguous() ? this->view(shape) : self->contiguous()->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (device < 0) {
+        device = (device_type == this->deviceType()) ? this->deviceId() : 0;
+    }
+    if (device_type == this->deviceType() && device == this->deviceId()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto moved = Tensor::create(_meta.shape, _meta.dtype, device_type, device);
+    copy_strided(moved, std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset)));
+    return moved;
 }
 
 } // namespace llaisys

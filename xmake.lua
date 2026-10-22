@@ -89,7 +89,11 @@ target("llaisys-ops")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
-    
+    if is_plat("linux") then
+        -- kernels use std::thread for parallelism instead of requiring OpenMP
+        add_syslinks("pthread")
+    end
+
     add_files("src/ops/*/*.cpp")
 
     on_install(function (target) end)
@@ -128,7 +132,12 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
-    add_files("src/llaisys/*.cc")
+    -- qwen2.cc is built by llaisys-models-qwen2 above; compiling it twice would
+    -- produce duplicate symbols.
+    add_files("src/llaisys/*.cc", {excludes = "src/llaisys/qwen2.cc"})
+    if is_plat("linux") then
+        add_syslinks("pthread")
+    end
     set_installdir(".")
     
     after_install(function (target)

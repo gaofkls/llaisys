@@ -1,162 +1,255 @@
 #include "llaisys/models/qwen2.h"
-#include "llaisys/ops.h"
-#include <vector>
-#include <memory>
-#include <cstring>
-#include <cmath>
-#include <iostream>
-#include <algorithm>
-#include <string>
 
-// 实际的模型实现结构体
+#include "api_guard.hpp"
+#include "llaisys_tensor.hpp"
+
+#include "../ops/add/op.hpp"
+#include "../ops/argmax/op.hpp"
+#include "../ops/embedding/op.hpp"
+#include "../ops/linear/op.hpp"
+#include "../ops/rearrange/op.hpp"
+#include "../ops/rms_norm/op.hpp"
+#include "../ops/rope/op.hpp"
+#include "../ops/sample/op.hpp"
+#include "../ops/self_attention/op.hpp"
+#include "../ops/swiglu/op.hpp"
+#include "../tensor/copy.hpp"
+#include "../tensor/tensor.hpp"
+#include "../utils.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+using llaisys::tensor_t;
+
+enum class WeightKind {
+    Unknown,
+    InEmbed,
+    OutEmbed,
+    OutNorm,
+    AttnNorm,
+    QWeight,
+    QBias,
+    KWeight,
+    KBias,
+    VWeight,
+    VBias,
+    OWeight,
+    MlpNorm,
+    GateWeight,
+    UpWeight,
+    DownWeight,
+};
+
+struct WeightRef {
+    WeightKind kind = WeightKind::Unknown;
+    size_t layer = 0;
+};
+
+tensor_t unwrap(llaisysTensor_t handle) {
+    return handle ? handle->tensor : nullptr;
+}
+
+tensor_t make(const std::vector<size_t> &shape, llaisysDataType_t dtype,
+              llaisysDeviceType_t device, int device_id) {
+    return llaisys::Tensor::create(shape, dtype, device, device_id);
+}
+
+// Reads one int64 back to the host, wherever the tensor lives.
+int64_t read_i64(const tensor_t &tensor) {
+    int64_t value = -1;
+    if (tensor->deviceType() == LLAISYS_DEVICE_CPU) {
+        std::memcpy(&value, tensor->data(), sizeof(int64_t));
+    } else {
+        llaisys::copy_run(reinterpret_cast<std::byte *>(&value), tensor->data(),
+                          sizeof(int64_t), LLAISYS_DEVICE_CPU, tensor->deviceType(),
+                          tensor->deviceId());
+    }
+    return value;
+}
+
+WeightRef parse_weight_name(const std::string &name) {
+    WeightRef ref;
+    if (name == "model.embed_tokens.weight" || name == "tok_embeddings.weight") {
+        ref.kind = WeightKind::InEmbed;
+        return ref;
+    }
+    if (name == "lm_head.weight" || name == "output.weight") {
+        ref.kind = WeightKind::OutEmbed;
+        return ref;
+    }
+    if (name == "model.norm.weight" || name == "norm.weight") {
+        ref.kind = WeightKind::OutNorm;
+        return ref;
+    }
+
+    const std::string prefix = "model.layers.";
+    if (name.rfind(prefix, 0) != 0) {
+        return ref;
+    }
+
+    const size_t layer_begin = prefix.size();
+    const size_t dot = name.find('.', layer_begin);
+    if (dot == std::string::npos) {
+        return ref;
+    }
+    try {
+        ref.layer = static_cast<size_t>(std::stoul(name.substr(layer_begin, dot - layer_begin)));
+    } catch (...) {
+        return ref;
+    }
+
+    const std::string field = name.substr(dot + 1);
+    if (field == "input_layernorm.weight") {
+        ref.kind = WeightKind::AttnNorm;
+    } else if (field == "post_attention_layernorm.weight") {
+        ref.kind = WeightKind::MlpNorm;
+    } else if (field == "self_attn.q_proj.weight") {
+        ref.kind = WeightKind::QWeight;
+    } else if (field == "self_attn.q_proj.bias") {
+        ref.kind = WeightKind::QBias;
+    } else if (field == "self_attn.k_proj.weight") {
+        ref.kind = WeightKind::KWeight;
+    } else if (field == "self_attn.k_proj.bias") {
+        ref.kind = WeightKind::KBias;
+    } else if (field == "self_attn.v_proj.weight") {
+        ref.kind = WeightKind::VWeight;
+    } else if (field == "self_attn.v_proj.bias") {
+        ref.kind = WeightKind::VBias;
+    } else if (field == "self_attn.o_proj.weight") {
+        ref.kind = WeightKind::OWeight;
+    } else if (field == "mlp.gate_proj.weight") {
+        ref.kind = WeightKind::GateWeight;
+    } else if (field == "mlp.up_proj.weight") {
+        ref.kind = WeightKind::UpWeight;
+    } else if (field == "mlp.down_proj.weight") {
+        ref.kind = WeightKind::DownWeight;
+    }
+    return ref;
+}
+
+float read_as_float(llaisysDataType_t dtype, const std::byte *base, size_t index) {
+    switch (dtype) {
+    case LLAISYS_DTYPE_F32:
+        return reinterpret_cast<const float *>(base)[index];
+    case LLAISYS_DTYPE_F16:
+        return llaisys::utils::cast<float>(
+            reinterpret_cast<const llaisys::fp16_t *>(base)[index]);
+    case LLAISYS_DTYPE_BF16:
+        return llaisys::utils::cast<float>(
+            reinterpret_cast<const llaisys::bf16_t *>(base)[index]);
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(dtype);
+    }
+}
+
+void write_from_float(llaisysDataType_t dtype, std::byte *base, size_t index, float value) {
+    switch (dtype) {
+    case LLAISYS_DTYPE_F32:
+        reinterpret_cast<float *>(base)[index] = value;
+        return;
+    case LLAISYS_DTYPE_F16:
+        reinterpret_cast<llaisys::fp16_t *>(base)[index] =
+            llaisys::utils::cast<llaisys::fp16_t>(value);
+        return;
+    case LLAISYS_DTYPE_BF16:
+        reinterpret_cast<llaisys::bf16_t *>(base)[index] =
+            llaisys::utils::cast<llaisys::bf16_t>(value);
+        return;
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(dtype);
+    }
+}
+
+} // namespace
+
+// The concrete model, private to the C++ side. Every intermediate tensor is a
+// shared_ptr<Tensor>, so scratch buffers are released automatically even when an
+// op throws halfway through a layer.
 struct LlaisysQwen2Model {
-    LlaisysQwen2Meta meta;
-    LlaisysQwen2Weights weights;
-    
-    // KV-Cache 存储
+    LlaisysQwen2Meta meta{};
+    LlaisysQwen2Weights weights{};
+    llaisysDeviceType_t device_type = LLAISYS_DEVICE_CPU;
+    int device_id = 0;
+
     struct LayerCache {
-        llaisysTensor_t k_cache;    // 存储原始K（未应用RoPE）
-        llaisysTensor_t v_cache;    // 存储原始V
-        size_t current_pos;         // 当前已缓存的位置
-        
-        LayerCache() : k_cache(nullptr), v_cache(nullptr), current_pos(0) {}
-        
-        // 移动构造函数
-        LayerCache(LayerCache&& other) noexcept 
-            : k_cache(other.k_cache), v_cache(other.v_cache), current_pos(other.current_pos) {
-            other.k_cache = nullptr;
-            other.v_cache = nullptr;
-            other.current_pos = 0;
-        }
-        
-        // 移动赋值运算符
-        LayerCache& operator=(LayerCache&& other) noexcept {
-            if (this != &other) {
-                // 释放当前资源
-                if (k_cache) tensorDestroy(k_cache);
-                if (v_cache) tensorDestroy(v_cache);
-                
-                // 转移资源
-                k_cache = other.k_cache;
-                v_cache = other.v_cache;
-                current_pos = other.current_pos;
-                
-                // 置空原对象
-                other.k_cache = nullptr;
-                other.v_cache = nullptr;
-                other.current_pos = 0;
-            }
-            return *this;
-        }
-        
-        ~LayerCache() {
-            if (k_cache) tensorDestroy(k_cache);
-            if (v_cache) tensorDestroy(v_cache);
-        }
-        
-        // 明确删除拷贝构造函数和拷贝赋值运算符
-        LayerCache(const LayerCache&) = delete;
-        LayerCache& operator=(const LayerCache&) = delete;
+        llaisysTensor_t k = nullptr; // keys *after* RoPE, shape [maxseq, nkvh, dh]
+        llaisysTensor_t v = nullptr; // values, shape [maxseq, nkvh, dh]
     };
-    
     std::vector<LayerCache> kv_cache;
-    
-    // 位置ID张量（预计算）
-    llaisysTensor_t pos_ids;
-    
-    // 当前序列长度
-    size_t current_seq_len;
-    
-    // 设备信息
-    llaisysDeviceType_t device_type;
-    int device_id;
-    
-    LlaisysQwen2Model(const LlaisysQwen2Meta& m, llaisysDeviceType_t dev_type, int* dev_ids, int ndevice)
-        : meta(m), current_seq_len(0), device_type(dev_type), device_id(0), pos_ids(nullptr) {
-        if (dev_ids && ndevice > 0) {
-            device_id = dev_ids[0];
+
+    size_t cached_tokens = 0;
+    size_t kv_capacity = 0;
+
+    static constexpr size_t kInitialCacheLen = 256;
+
+    LlaisysQwen2Model(const LlaisysQwen2Meta &m, llaisysDeviceType_t device, int *device_ids,
+                      int ndevice)
+        : meta(m), device_type(device), device_id(0) {
+        if (device_ids != nullptr && ndevice > 0) {
+            device_id = device_ids[0];
         }
-        
-        // 初始化权重结构
-        memset(&weights, 0, sizeof(LlaisysQwen2Weights));
-        
-        // 为指针数组分配内存
-        weights.attn_norm_w = new llaisysTensor_t[meta.nlayer];
-        weights.attn_q_w = new llaisysTensor_t[meta.nlayer];
-        weights.attn_q_b = new llaisysTensor_t[meta.nlayer];
-        weights.attn_k_w = new llaisysTensor_t[meta.nlayer];
-        weights.attn_k_b = new llaisysTensor_t[meta.nlayer];
-        weights.attn_v_w = new llaisysTensor_t[meta.nlayer];
-        weights.attn_v_b = new llaisysTensor_t[meta.nlayer];
-        weights.attn_o_w = new llaisysTensor_t[meta.nlayer];
-        weights.mlp_norm_w = new llaisysTensor_t[meta.nlayer];
-        weights.mlp_gate_w = new llaisysTensor_t[meta.nlayer];
-        weights.mlp_up_w = new llaisysTensor_t[meta.nlayer];
-        weights.mlp_down_w = new llaisysTensor_t[meta.nlayer];
-        
-        // 初始化指针为nullptr
-        for (size_t i = 0; i < meta.nlayer; i++) {
-            weights.attn_norm_w[i] = nullptr;
-            weights.attn_q_w[i] = nullptr;
-            weights.attn_q_b[i] = nullptr;
-            weights.attn_k_w[i] = nullptr;
-            weights.attn_k_b[i] = nullptr;
-            weights.attn_v_w[i] = nullptr;
-            weights.attn_v_b[i] = nullptr;
-            weights.attn_o_w[i] = nullptr;
-            weights.mlp_norm_w[i] = nullptr;
-            weights.mlp_gate_w[i] = nullptr;
-            weights.mlp_up_w[i] = nullptr;
-            weights.mlp_down_w[i] = nullptr;
+
+        CHECK_ARGUMENT(meta.nlayer > 0 && meta.hs > 0 && meta.nh > 0 && meta.nkvh > 0
+                           && meta.dh > 0 && meta.di > 0 && meta.maxseq > 0 && meta.voc > 0,
+                       "qwen2: invalid model meta.");
+        CHECK_ARGUMENT(meta.nh * meta.dh == meta.hs,
+                       "qwen2: nh * dh must equal hidden_size.");
+        CHECK_ARGUMENT(meta.nh % meta.nkvh == 0,
+                       "qwen2: num_attention_heads must be a multiple of num_kv_heads.");
+
+        weights.attn_norm_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_q_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_q_b = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_k_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_k_b = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_v_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_v_b = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_o_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_norm_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_gate_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_up_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_down_w = new llaisysTensor_t[meta.nlayer]();
+
+        // Reserve a small cache and grow it on demand. Allocating
+        // max_position_embeddings up front would cost several GB for a 1.5B model
+        // (131072 positions * 2 kv heads * 128 dims * 2 bytes * 2 tensors * 28 layers).
+        kv_cache.resize(meta.nlayer);
+        kv_capacity = std::min<size_t>(meta.maxseq, kInitialCacheLen);
+        const std::vector<size_t> cache_shape = {kv_capacity, meta.nkvh, meta.dh};
+        for (size_t i = 0; i < meta.nlayer; ++i) {
+            kv_cache[i].k = wrap(make(cache_shape, meta.dtype, device_type, device_id));
+            kv_cache[i].v = wrap(make(cache_shape, meta.dtype, device_type, device_id));
         }
-        
-        // 初始化位置ID张量
-        size_t maxseq_shape[] = {meta.maxseq};
-        pos_ids = tensorCreate(maxseq_shape, 1, LLAISYS_DTYPE_I64, device_type, device_id);
-        
-        if (pos_ids) {
-            int64_t* pos_data = static_cast<int64_t*>(tensorGetData(pos_ids));
-            for (size_t i = 0; i < meta.maxseq; i++) {
-                pos_data[i] = i;
+    }
+
+    ~LlaisysQwen2Model() {
+        if (weights.attn_norm_w != nullptr) {
+            for (size_t i = 0; i < meta.nlayer; ++i) {
+                destroy(weights.attn_norm_w[i]);
+                destroy(weights.attn_q_w[i]);
+                destroy(weights.attn_q_b[i]);
+                destroy(weights.attn_k_w[i]);
+                destroy(weights.attn_k_b[i]);
+                destroy(weights.attn_v_w[i]);
+                destroy(weights.attn_v_b[i]);
+                destroy(weights.attn_o_w[i]);
+                destroy(weights.mlp_norm_w[i]);
+                destroy(weights.mlp_gate_w[i]);
+                destroy(weights.mlp_up_w[i]);
+                destroy(weights.mlp_down_w[i]);
             }
         }
-        
-        // 初始化KV-Cache - 使用 reserve 和 emplace_back 避免拷贝
-        kv_cache.reserve(meta.nlayer);
-        for (size_t i = 0; i < meta.nlayer; i++) {
-            kv_cache.emplace_back();  // 使用就地构造
-        }
-        
-        // 然后为每个LayerCache创建张量
-        size_t cache_shape[3] = {meta.maxseq, meta.nkvh, meta.dh};
-        for (size_t i = 0; i < meta.nlayer; i++) {
-            kv_cache[i].k_cache = tensorCreate(cache_shape, 3, meta.dtype, device_type, device_id);
-            kv_cache[i].v_cache = tensorCreate(cache_shape, 3, meta.dtype, device_type, device_id);
-        }
-    }
-    
-    // 移动构造函数
-    LlaisysQwen2Model(LlaisysQwen2Model&& other) noexcept 
-        : meta(other.meta),
-          weights(other.weights),
-          kv_cache(std::move(other.kv_cache)),
-          pos_ids(other.pos_ids),
-          current_seq_len(other.current_seq_len),
-          device_type(other.device_type),
-          device_id(other.device_id) {
-        
-        // 转移所有权后置空原对象
-        other.pos_ids = nullptr;
-        memset(&other.weights, 0, sizeof(LlaisysQwen2Weights));
-        other.kv_cache.clear();
-    }
-    
-    // 删除拷贝构造函数和拷贝赋值运算符
-    LlaisysQwen2Model(const LlaisysQwen2Model&) = delete;
-    LlaisysQwen2Model& operator=(const LlaisysQwen2Model&) = delete;
-    
-    ~LlaisysQwen2Model() {
-        // 释放权重指针数组
+        destroy(weights.in_embed);
+        destroy(weights.out_embed);
+        destroy(weights.out_norm_w);
+
         delete[] weights.attn_norm_w;
         delete[] weights.attn_q_w;
         delete[] weights.attn_q_b;
@@ -169,752 +262,413 @@ struct LlaisysQwen2Model {
         delete[] weights.mlp_gate_w;
         delete[] weights.mlp_up_w;
         delete[] weights.mlp_down_w;
-        
-        // 释放位置ID张量
-        if (pos_ids) tensorDestroy(pos_ids);
-        
-        // kv_cache会在vector析构时自动清理
+
+        for (auto &cache : kv_cache) {
+            destroy(cache.k);
+            destroy(cache.v);
+        }
     }
-    
-    // 更新KV-Cache
-    void update_kv_cache(size_t layer_idx, llaisysTensor_t k_raw, llaisysTensor_t v_raw, size_t pos) {
-        if (layer_idx >= kv_cache.size()) return;
-        
-        LayerCache& cache = kv_cache[layer_idx];
-        if (!cache.k_cache || !cache.v_cache || !k_raw || !v_raw) return;
-        
-        // 获取数据指针
-        void* k_cache_data = tensorGetData(cache.k_cache);
-        void* v_cache_data = tensorGetData(cache.v_cache);
-        void* k_raw_data = tensorGetData(k_raw);
-        void* v_raw_data = tensorGetData(v_raw);
-        
-        if (!k_cache_data || !v_cache_data || !k_raw_data || !v_raw_data) return;
-        
-        // 计算要复制的数据量
-        size_t kv_size = meta.nkvh * meta.dh;
-        size_t elem_size = 0;
-        
-        switch (meta.dtype) {
-            case LLAISYS_DTYPE_F32: elem_size = 4; break;
-            case LLAISYS_DTYPE_F16: elem_size = 2; break;
-            case LLAISYS_DTYPE_BF16: elem_size = 2; break;
-            default: elem_size = 4; break;
-        }
-        
-        // 计算目标位置
-        size_t k_offset = pos * kv_size * elem_size;
-        size_t v_offset = pos * kv_size * elem_size;
-        
-        // 复制数据
-        memcpy(static_cast<char*>(k_cache_data) + k_offset, k_raw_data, kv_size * elem_size);
-        memcpy(static_cast<char*>(v_cache_data) + v_offset, v_raw_data, kv_size * elem_size);
-        
-        // 更新当前位置
-        cache.current_pos = pos + 1;
+
+    LlaisysQwen2Model(const LlaisysQwen2Model &) = delete;
+    LlaisysQwen2Model &operator=(const LlaisysQwen2Model &) = delete;
+
+    static llaisysTensor_t wrap(const tensor_t &tensor) { return new LlaisysTensor{tensor}; }
+
+    static void destroy(llaisysTensor_t &handle) {
+        delete handle;
+        handle = nullptr;
     }
-    
-    // 从缓存获取K,V并应用RoPE
-    void get_kv_from_cache(size_t layer_idx, llaisysTensor_t& k_out, llaisysTensor_t& v_out, 
-                          size_t start_pos, size_t seq_len) {
-        if (layer_idx >= kv_cache.size()) {
-            k_out = v_out = nullptr;
-            return;
+
+    // ---------------------------------------------------------------- weights --
+
+    llaisysTensor_t *slot_for(WeightKind kind, size_t layer) {
+        switch (kind) {
+        case WeightKind::InEmbed:
+            return &weights.in_embed;
+        case WeightKind::OutEmbed:
+            return &weights.out_embed;
+        case WeightKind::OutNorm:
+            return &weights.out_norm_w;
+        case WeightKind::AttnNorm:
+            return &weights.attn_norm_w[layer];
+        case WeightKind::QWeight:
+            return &weights.attn_q_w[layer];
+        case WeightKind::QBias:
+            return &weights.attn_q_b[layer];
+        case WeightKind::KWeight:
+            return &weights.attn_k_w[layer];
+        case WeightKind::KBias:
+            return &weights.attn_k_b[layer];
+        case WeightKind::VWeight:
+            return &weights.attn_v_w[layer];
+        case WeightKind::VBias:
+            return &weights.attn_v_b[layer];
+        case WeightKind::OWeight:
+            return &weights.attn_o_w[layer];
+        case WeightKind::MlpNorm:
+            return &weights.mlp_norm_w[layer];
+        case WeightKind::GateWeight:
+            return &weights.mlp_gate_w[layer];
+        case WeightKind::UpWeight:
+            return &weights.mlp_up_w[layer];
+        case WeightKind::DownWeight:
+            return &weights.mlp_down_w[layer];
+        default:
+            return nullptr;
         }
-        
-        LayerCache& cache = kv_cache[layer_idx];
-        if (!cache.k_cache || !cache.v_cache || cache.current_pos == 0) {
-            k_out = v_out = nullptr;
-            return;
+    }
+
+    std::vector<size_t> expected_shape(WeightKind kind) const {
+        const size_t q_dim = meta.nh * meta.dh;
+        const size_t kv_dim = meta.nkvh * meta.dh;
+        switch (kind) {
+        case WeightKind::InEmbed:
+        case WeightKind::OutEmbed:
+            return {meta.voc, meta.hs};
+        case WeightKind::OutNorm:
+        case WeightKind::AttnNorm:
+        case WeightKind::MlpNorm:
+            return {meta.hs};
+        case WeightKind::QWeight:
+            return {q_dim, meta.hs};
+        case WeightKind::QBias:
+            return {q_dim};
+        case WeightKind::KWeight:
+        case WeightKind::VWeight:
+            return {kv_dim, meta.hs};
+        case WeightKind::KBias:
+        case WeightKind::VBias:
+            return {kv_dim};
+        case WeightKind::OWeight:
+            return {meta.hs, q_dim};
+        case WeightKind::GateWeight:
+        case WeightKind::UpWeight:
+            return {meta.di, meta.hs};
+        case WeightKind::DownWeight:
+            return {meta.hs, meta.di};
+        default:
+            return {};
         }
-        
-        // 实际可用的缓存长度
-        size_t cache_len = std::min(cache.current_pos, start_pos + seq_len);
-        size_t actual_len = cache_len - start_pos;
-        
-        if (actual_len == 0) {
-            k_out = v_out = nullptr;
-            return;
+    }
+
+    bool load_weight(const std::string &name, const void *data, const std::vector<size_t> &shape,
+                     llaisysDataType_t src_dtype) {
+        const WeightRef ref = parse_weight_name(name);
+        if (ref.kind == WeightKind::Unknown) {
+            std::cerr << "[qwen2] unknown weight name: " << name << std::endl;
+            return false;
         }
-        
-        // 1. 从缓存切片获取原始K/V
-        size_t kv_shape[3] = {actual_len, meta.nkvh, meta.dh};
-        
-        k_out = tensorSlice(cache.k_cache, 0, start_pos, cache_len);
-        v_out = tensorSlice(cache.v_cache, 0, start_pos, cache_len);
-        
-        // reshape为3D
-        k_out = tensorView(k_out, kv_shape, 3);
-        v_out = tensorView(v_out, kv_shape, 3);
-        
-        // 2. 为RoPE创建位置ID
-        size_t pos_shape[] = {actual_len};
-        llaisysTensor_t pos_ids_slice = tensorCreate(pos_shape, 1, LLAISYS_DTYPE_I64, device_type, device_id);
-        
-        if (pos_ids_slice) {
-            int64_t* pos_data = static_cast<int64_t*>(tensorGetData(pos_ids_slice));
-            for (size_t i = 0; i < actual_len; i++) {
-                pos_data[i] = start_pos + i;
+        if (ref.kind != WeightKind::InEmbed && ref.kind != WeightKind::OutEmbed
+            && ref.kind != WeightKind::OutNorm && ref.layer >= meta.nlayer) {
+            std::cerr << "[qwen2] layer index out of range for " << name << std::endl;
+            return false;
+        }
+
+        llaisysTensor_t *slot = slot_for(ref.kind, ref.layer);
+        if (slot == nullptr) {
+            return false;
+        }
+
+        const std::vector<size_t> expected = expected_shape(ref.kind);
+        if (shape != expected) {
+            std::cerr << "[qwen2] shape mismatch for " << name << ": got [";
+            for (size_t i = 0; i < shape.size(); ++i) {
+                std::cerr << shape[i] << (i + 1 < shape.size() ? ", " : "");
             }
-            
-            // 3. 应用RoPE到K
-            llaisysTensor_t k_with_rope = tensorCreate(kv_shape, 3, meta.dtype, device_type, device_id);
-            llaisysROPE(k_with_rope, k_out, pos_ids_slice, meta.theta);
-            
-            // 替换为带RoPE的K
-            tensorDestroy(k_out);
-            k_out = k_with_rope;
-            
-            tensorDestroy(pos_ids_slice);
+            std::cerr << "], expected [";
+            for (size_t i = 0; i < expected.size(); ++i) {
+                std::cerr << expected[i] << (i + 1 < expected.size() ? ", " : "");
+            }
+            std::cerr << "]" << std::endl;
+            return false;
         }
-        // 如果创建pos_ids失败，k_out保持原始K（未应用RoPE）
+
+        size_t numel = 1;
+        for (size_t dim : shape) {
+            numel *= dim;
+        }
+
+        tensor_t tensor = make(shape, meta.dtype, device_type, device_id);
+
+        if (src_dtype == meta.dtype) {
+            // Fast path: identical layout, one bulk copy (H2D on GPU).
+            llaisys::copy_run(tensor->data(), static_cast<const std::byte *>(data),
+                              numel * tensor->elementSize(), tensor->deviceType(),
+                              LLAISYS_DEVICE_CPU, device_id);
+        } else {
+            // Slow path, load time only: convert element by element on the host.
+            std::vector<std::byte> converted(numel * tensor->elementSize());
+            const auto *src = static_cast<const std::byte *>(data);
+            for (size_t i = 0; i < numel; ++i) {
+                write_from_float(meta.dtype, converted.data(), i,
+                                 read_as_float(src_dtype, src, i));
+            }
+            llaisys::copy_run(tensor->data(), converted.data(), converted.size(),
+                              tensor->deviceType(), LLAISYS_DEVICE_CPU, device_id);
+        }
+
+        destroy(*slot);
+        *slot = wrap(tensor);
+        return true;
+    }
+
+    // --------------------------------------------------------------- forward --
+
+    void check_layer_weights(size_t layer) const {
+        const bool ok = weights.attn_norm_w[layer] && weights.attn_q_w[layer]
+            && weights.attn_k_w[layer] && weights.attn_v_w[layer] && weights.attn_o_w[layer]
+            && weights.mlp_norm_w[layer] && weights.mlp_gate_w[layer]
+            && weights.mlp_up_w[layer] && weights.mlp_down_w[layer];
+        CHECK_ARGUMENT(ok, "qwen2: some layer weights were never loaded.");
+    }
+
+    // Grows the KV cache by doubling until it can hold `needed` positions.
+    void ensure_capacity(size_t needed) {
+        if (needed <= kv_capacity) {
+            return;
+        }
+
+        size_t new_capacity = (kv_capacity == 0) ? kInitialCacheLen : kv_capacity;
+        while (new_capacity < needed) {
+            new_capacity *= 2;
+        }
+        new_capacity = std::min(new_capacity, meta.maxseq);
+        CHECK_ARGUMENT(needed <= new_capacity,
+                       "qwen2: sequence is longer than max_position_embeddings.");
+
+        const size_t keep = std::min(cached_tokens, new_capacity);
+        for (auto &cache : kv_cache) {
+            tensor_t old_k = unwrap(cache.k);
+            tensor_t old_v = unwrap(cache.v);
+
+            tensor_t new_k =
+                make({new_capacity, meta.nkvh, meta.dh}, meta.dtype, device_type, device_id);
+            tensor_t new_v =
+                make({new_capacity, meta.nkvh, meta.dh}, meta.dtype, device_type, device_id);
+
+            if (keep > 0) {
+                llaisys::ops::rearrange(new_k->slice(0, 0, keep), old_k->slice(0, 0, keep));
+                llaisys::ops::rearrange(new_v->slice(0, 0, keep), old_v->slice(0, 0, keep));
+            }
+
+            destroy(cache.k);
+            destroy(cache.v);
+            cache.k = wrap(new_k);
+            cache.v = wrap(new_v);
+        }
+
+        kv_capacity = new_capacity;
+    }
+
+    // Copies `count` freshly computed keys/values into the cache at [start, start+count).
+    void cache_store(llaisysTensor_t cache, size_t start, size_t count,
+                     const tensor_t &block) {
+        tensor_t dst = unwrap(cache)->slice(0, start, start + count);
+        llaisys::ops::rearrange(dst, block);
+    }
+
+    // Runs the forward pass and returns the next token. `temperature <= 0` or
+    // `top_k == 1` selects greedy decoding; otherwise the logits go through the
+    // sample operator, which advances `rng_state`.
+    int64_t infer(const int64_t *token_ids, size_t ntoken, float temperature, size_t top_k,
+                  float top_p, uint64_t *rng_state) {
+        CHECK_ARGUMENT(token_ids != nullptr && ntoken > 0, "qwen2: empty input.");
+
+        // Continue from the cached prefix. If the caller re-sent tokens we have
+        // already processed, rewind one token so this call still produces a
+        // prediction (recomputing a token is idempotent: RoPE uses the position).
+        size_t start = cached_tokens;
+        if (start >= ntoken) {
+            start = ntoken - 1;
+        }
+        const size_t seq = ntoken - start;
+        ensure_capacity(start + seq);
+
+        const size_t hs = meta.hs;
+        const size_t dh = meta.dh;
+        const size_t nh = meta.nh;
+        const size_t nkvh = meta.nkvh;
+        const size_t kv_dim = nkvh * dh;
+
+        CHECK_ARGUMENT(weights.in_embed && weights.out_embed && weights.out_norm_w,
+                       "qwen2: model weights were never loaded.");
+
+        // 1. Token ids -> embedding.
+        tensor_t index = make({seq}, LLAISYS_DTYPE_I64, device_type, device_id);
+        index->load(token_ids + start);
+
+        tensor_t hidden = make({seq, hs}, meta.dtype, device_type, device_id);
+        llaisys::ops::embedding(hidden, index, unwrap(weights.in_embed));
+
+        // 2. Positions of the new tokens.
+        std::vector<int64_t> pos_host(seq);
+        for (size_t i = 0; i < seq; ++i) {
+            pos_host[i] = static_cast<int64_t>(start + i);
+        }
+        tensor_t pos_ids = make({seq}, LLAISYS_DTYPE_I64, device_type, device_id);
+        pos_ids->load(pos_host.data());
+
+        const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+
+        for (size_t layer = 0; layer < meta.nlayer; ++layer) {
+            check_layer_weights(layer);
+
+            // --- attention block ---
+            tensor_t normed = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::rms_norm(normed, hidden, unwrap(weights.attn_norm_w[layer]),
+                                   meta.epsilon);
+
+            tensor_t q = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(q, normed, unwrap(weights.attn_q_w[layer]),
+                                 unwrap(weights.attn_q_b[layer]));
+
+            tensor_t k = make({seq, kv_dim}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(k, normed, unwrap(weights.attn_k_w[layer]),
+                                 unwrap(weights.attn_k_b[layer]));
+
+            tensor_t v = make({seq, kv_dim}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(v, normed, unwrap(weights.attn_v_w[layer]),
+                                 unwrap(weights.attn_v_b[layer]));
+
+            // [seq, heads * head_dim] -> [seq, heads, head_dim]
+            tensor_t q3 = q->view({seq, nh, dh});
+            tensor_t k3 = k->view({seq, nkvh, dh});
+            tensor_t v3 = v->view({seq, nkvh, dh});
+
+            tensor_t q_rot = make({seq, nh, dh}, meta.dtype, device_type, device_id);
+            llaisys::ops::rope(q_rot, q3, pos_ids, meta.theta);
+
+            tensor_t k_rot = make({seq, nkvh, dh}, meta.dtype, device_type, device_id);
+            llaisys::ops::rope(k_rot, k3, pos_ids, meta.theta);
+
+            // Cache stores post-RoPE keys: RoPE only ever depends on the absolute
+            // position, so there is no reason to redo it on every step.
+            const size_t total = start + seq;
+            cache_store(kv_cache[layer].k, start, seq, k_rot);
+            cache_store(kv_cache[layer].v, start, seq, v3);
+
+            tensor_t k_all = unwrap(kv_cache[layer].k)->slice(0, 0, total);
+            tensor_t v_all = unwrap(kv_cache[layer].v)->slice(0, 0, total);
+
+            tensor_t attn = make({seq, nh, dh}, meta.dtype, device_type, device_id);
+            llaisys::ops::self_attention(attn, q_rot, k_all, v_all, scale);
+
+            tensor_t attn2d = attn->view({seq, hs});
+            tensor_t projected = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(projected, attn2d, unwrap(weights.attn_o_w[layer]), nullptr);
+
+            tensor_t hidden_attn = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::add(hidden_attn, hidden, projected);
+            hidden = hidden_attn;
+
+            // --- mlp block ---
+            tensor_t normed2 = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::rms_norm(normed2, hidden, unwrap(weights.mlp_norm_w[layer]),
+                                   meta.epsilon);
+
+            tensor_t gate = make({seq, meta.di}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(gate, normed2, unwrap(weights.mlp_gate_w[layer]), nullptr);
+
+            tensor_t up = make({seq, meta.di}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(up, normed2, unwrap(weights.mlp_up_w[layer]), nullptr);
+
+            tensor_t act = make({seq, meta.di}, meta.dtype, device_type, device_id);
+            llaisys::ops::swiglu(act, gate, up);
+
+            tensor_t down = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::linear(down, act, unwrap(weights.mlp_down_w[layer]), nullptr);
+
+            tensor_t hidden_mlp = make({seq, hs}, meta.dtype, device_type, device_id);
+            llaisys::ops::add(hidden_mlp, hidden, down);
+            hidden = hidden_mlp;
+        }
+
+        // 3. Final norm, then only the last row needs to reach the vocabulary.
+        tensor_t final_norm = make({seq, hs}, meta.dtype, device_type, device_id);
+        llaisys::ops::rms_norm(final_norm, hidden, unwrap(weights.out_norm_w), meta.epsilon);
+
+        tensor_t last = final_norm->slice(0, seq - 1, seq);
+
+        tensor_t logits = make({1, meta.voc}, meta.dtype, device_type, device_id);
+        llaisys::ops::linear(logits, last, unwrap(weights.out_embed), nullptr);
+
+        tensor_t logits1d = logits->view({meta.voc});
+        tensor_t token = make({1}, LLAISYS_DTYPE_I64, device_type, device_id);
+        if (top_k == 1 || !(temperature > 0.0f)) {
+            tensor_t max_val = make({1}, meta.dtype, device_type, device_id);
+            llaisys::ops::argmax(token, max_val, logits1d);
+        } else {
+            llaisys::ops::sample(token, logits1d, temperature, top_k, top_p, rng_state);
+        }
+
+        cached_tokens = start + seq;
+        return read_i64(token);
+    }
+
+    void reset() {
+        cached_tokens = 0;
     }
 };
 
-// ==================== 完整注意力机制实现 ====================
+// ============================== C API ========================================
 
-// RMSNorm辅助函数
-static void apply_rms_norm(llaisysTensor_t out, llaisysTensor_t in, 
-                          llaisysTensor_t weight, float eps) {
-    llaisysRmsNorm(out, in, weight, eps);
+__export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta,
+                                                           llaisysDeviceType_t device,
+                                                           int *device_ids, int ndevice) {
+    return llaisys::api::run("llaisysQwen2ModelCreate",
+                             static_cast<LlaisysQwen2Model *>(nullptr), [&]() {
+                                 CHECK_ARGUMENT(meta != nullptr, "qwen2: meta is null.");
+                                 return new LlaisysQwen2Model(*meta, device, device_ids, ndevice);
+                             });
 }
 
-// 完整注意力层实现
-static void apply_attention_layer(LlaisysQwen2Model* model, 
-                                 llaisysTensor_t& hidden_states,
-                                 size_t layer_idx,
-                                 size_t seq_pos,
-                                 size_t seq_len) {
-    
-    auto& cache = model->kv_cache[layer_idx];
-    
-    // 1. RMSNorm
-    size_t hidden_shape[2];
-    tensorGetShape(hidden_states, hidden_shape);
-    
-    llaisysTensor_t normed = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                         model->device_type, model->device_id);
-    apply_rms_norm(normed, hidden_states, model->weights.attn_norm_w[layer_idx], 
-                  model->meta.epsilon);
-    
-    // 2. 计算Q, K, V投影
-    llaisysTensor_t q_proj = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                         model->device_type, model->device_id);
-    llaisysTensor_t k_proj = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                         model->device_type, model->device_id);
-    llaisysTensor_t v_proj = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                         model->device_type, model->device_id);
-    
-    // 线性投影
-    llaisysLinear(q_proj, normed, model->weights.attn_q_w[layer_idx], 
-                 model->weights.attn_q_b[layer_idx]);
-    llaisysLinear(k_proj, normed, model->weights.attn_k_w[layer_idx],
-                 model->weights.attn_k_b[layer_idx]);
-    llaisysLinear(v_proj, normed, model->weights.attn_v_w[layer_idx],
-                 model->weights.attn_v_b[layer_idx]);
-    
-    // 3. 重塑为多头格式
-    // Q: [seq_len, num_heads, head_dim]
-    // K, V: [seq_len, num_kv_heads, head_dim]
-    size_t q_3d_shape[3] = {seq_len, model->meta.nh, model->meta.dh};
-    size_t kv_3d_shape[3] = {seq_len, model->meta.nkvh, model->meta.dh};
-    
-    llaisysTensor_t q_3d = tensorView(q_proj, q_3d_shape, 3);
-    llaisysTensor_t k_raw_3d = tensorView(k_proj, kv_3d_shape, 3);
-    llaisysTensor_t v_raw_3d = tensorView(v_proj, kv_3d_shape, 3);
-    
-    // 4. 应用RoPE到Q（对于新token）
-    size_t pos_shape[] = {seq_len};
-    llaisysTensor_t pos_ids = tensorCreate(pos_shape, 1, LLAISYS_DTYPE_I64,
-                                          model->device_type, model->device_id);
-    
-    int64_t* pos_data = static_cast<int64_t*>(tensorGetData(pos_ids));
-    for (size_t i = 0; i < seq_len; i++) {
-        pos_data[i] = seq_pos + i;
-    }
-    
-    llaisysTensor_t q_rope = tensorCreate(q_3d_shape, 3, model->meta.dtype,
-                                         model->device_type, model->device_id);
-    llaisysROPE(q_rope, q_3d, pos_ids, model->meta.theta);
-    
-    // 5. 更新KV-Cache（存储原始K，未应用RoPE）
-    if (seq_pos >= cache.current_pos) {
-        // 对于多token，只更新最后一个
-        if (seq_len == 1) {
-            model->update_kv_cache(layer_idx, k_raw_3d, v_raw_3d, seq_pos);
-        } else {
-            // 取最后一个token
-            llaisysTensor_t k_last = tensorSlice(k_raw_3d, 0, seq_len - 1, seq_len);
-            llaisysTensor_t v_last = tensorSlice(v_raw_3d, 0, seq_len - 1, seq_len);
-            
-            size_t slice_shape[3] = {1, model->meta.nkvh, model->meta.dh};
-            k_last = tensorView(k_last, slice_shape, 3);
-            v_last = tensorView(v_last, slice_shape, 3);
-            
-            model->update_kv_cache(layer_idx, k_last, v_last, seq_pos + seq_len - 1);
-            
-            tensorDestroy(k_last);
-            tensorDestroy(v_last);
-        }
-    }
-    
-    // 6. 准备用于注意力计算的K和V
-    llaisysTensor_t k_for_attn = nullptr;
-    llaisysTensor_t v_for_attn = nullptr;
-    
-    // 总序列长度 = 缓存长度 + 新token长度
-    size_t total_seq_len = cache.current_pos + seq_len;
-    
-    if (cache.current_pos > 0) {
-        // 有缓存：从缓存获取所有K/V（包括应用RoPE）
-        model->get_kv_from_cache(layer_idx, k_for_attn, v_for_attn, 0, cache.current_pos);
-        
-        // 需要将新token的K/V与缓存的K/V拼接
-        if (k_for_attn && v_for_attn && seq_len > 0) {
-            // 应用RoPE到新token的K
-            llaisysTensor_t k_new_rope = tensorCreate(kv_3d_shape, 3, model->meta.dtype,
-                                                     model->device_type, model->device_id);
-            llaisysROPE(k_new_rope, k_raw_3d, pos_ids, model->meta.theta);
-            
-            // TODO: 这里需要张量拼接操作
-            // 简化：如果只有一个新token，且缓存是完整的，直接使用缓存的
-            // 对于多个新token，需要更复杂的逻辑
-            
-            tensorDestroy(k_new_rope);
-        }
-    } else {
-        // 无缓存：使用新token的K/V，并应用RoPE到K
-        k_for_attn = tensorCreate(kv_3d_shape, 3, model->meta.dtype,
-                                 model->device_type, model->device_id);
-        llaisysROPE(k_for_attn, k_raw_3d, pos_ids, model->meta.theta);
-        v_for_attn = v_raw_3d;  // V直接使用
-    }
-    
-    // 7. 计算注意力
-    float scale = 1.0f / sqrtf(static_cast<float>(model->meta.dh));
-    
-    // 注意力输出形状: [seq_len, num_heads, head_dim]
-    size_t attn_3d_shape[3] = {seq_len, model->meta.nh, model->meta.dh};
-    llaisysTensor_t attn_output_3d = tensorCreate(attn_3d_shape, 3, model->meta.dtype,
-                                                 model->device_type, model->device_id);
-    
-    // 调用self-attention
-    // 注意：如果使用缓存，K/V的序列长度会大于Q的序列长度
-    // self-attention内部会处理因果掩码
-    llaisysSelfAttention(attn_output_3d, q_rope, k_for_attn, v_for_attn, scale);
-    
-    // 8. 重塑回2D: [seq_len, hidden_size]
-    size_t attn_out_2d_shape[2] = {seq_len, model->meta.hs};
-    llaisysTensor_t attn_output = tensorView(attn_output_3d, attn_out_2d_shape, 2);
-    
-    // 9. 输出投影
-    llaisysTensor_t proj_output = tensorCreate(attn_out_2d_shape, 2, model->meta.dtype,
-                                              model->device_type, model->device_id);
-    llaisysLinear(proj_output, attn_output, model->weights.attn_o_w[layer_idx], nullptr);
-    
-    // 10. 残差连接
-    llaisysTensor_t new_hidden = tensorCreate(attn_out_2d_shape, 2, model->meta.dtype,
-                                             model->device_type, model->device_id);
-    llaisysAdd(new_hidden, hidden_states, proj_output);
-    
-    // 11. 清理
-    tensorDestroy(hidden_states);
-    hidden_states = new_hidden;
-    
-    // 释放中间张量
-    tensorDestroy(normed);
-    tensorDestroy(q_proj);
-    tensorDestroy(k_proj);
-    tensorDestroy(v_proj);
-    tensorDestroy(q_3d);
-    tensorDestroy(k_raw_3d);
-    tensorDestroy(v_raw_3d);
-    tensorDestroy(pos_ids);
-    tensorDestroy(q_rope);
-    if (k_for_attn && k_for_attn != k_raw_3d) tensorDestroy(k_for_attn);
-    if (v_for_attn && v_for_attn != v_raw_3d) tensorDestroy(v_for_attn);
-    tensorDestroy(attn_output_3d);
-    tensorDestroy(attn_output);
-    tensorDestroy(proj_output);
+__export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model *model) {
+    llaisys::api::run_void("llaisysQwen2ModelDestroy", [&]() { delete model; });
 }
 
-// MLP层实现
-static void apply_mlp_layer(LlaisysQwen2Model* model,
-                           llaisysTensor_t& hidden_states,
-                           size_t layer_idx,
-                           size_t seq_len) {
-    
-    // 1. RMSNorm
-    size_t hidden_shape[2];
-    tensorGetShape(hidden_states, hidden_shape);
-    
-    llaisysTensor_t normed = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                         model->device_type, model->device_id);
-    apply_rms_norm(normed, hidden_states, model->weights.mlp_norm_w[layer_idx],
-                  model->meta.epsilon);
-    
-    // 2. Gate和Up投影
-    llaisysTensor_t gate_proj = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                            model->device_type, model->device_id);
-    llaisysTensor_t up_proj = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                          model->device_type, model->device_id);
-    
-    llaisysLinear(gate_proj, normed, model->weights.mlp_gate_w[layer_idx], nullptr);
-    llaisysLinear(up_proj, normed, model->weights.mlp_up_w[layer_idx], nullptr);
-    
-    // 3. SwiGLU激活
-    llaisysTensor_t activated = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                            model->device_type, model->device_id);
-    llaisysSwiGLU(activated, gate_proj, up_proj);
-    
-    // 4. Down投影
-    llaisysTensor_t down_proj = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                            model->device_type, model->device_id);
-    llaisysLinear(down_proj, activated, model->weights.mlp_down_w[layer_idx], nullptr);
-    
-    // 5. 残差连接
-    llaisysTensor_t new_hidden = tensorCreate(hidden_shape, 2, model->meta.dtype,
-                                             model->device_type, model->device_id);
-    llaisysAdd(new_hidden, hidden_states, down_proj);
-    
-    // 6. 清理
-    tensorDestroy(hidden_states);
-    hidden_states = new_hidden;
-    
-    tensorDestroy(normed);
-    tensorDestroy(gate_proj);
-    tensorDestroy(up_proj);
-    tensorDestroy(activated);
-    tensorDestroy(down_proj);
+__export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *model) {
+    return llaisys::api::run("llaisysQwen2ModelWeights",
+                             static_cast<LlaisysQwen2Weights *>(nullptr),
+                             [&]() { return model ? &model->weights : nullptr; });
 }
 
-// ==================== C API 实现 ====================
+__export bool llaisysQwen2ModelLoadWeight(struct LlaisysQwen2Model *model,
+                                          const char *weight_name, const void *data,
+                                          const size_t *shape, size_t ndim, int dtype) {
+    return llaisys::api::run("llaisysQwen2ModelLoadWeight", false, [&]() {
+        CHECK_ARGUMENT(model != nullptr, "qwen2: model is null.");
+        CHECK_ARGUMENT(weight_name != nullptr && data != nullptr, "qwen2: null weight.");
+        CHECK_ARGUMENT(shape != nullptr || ndim == 0, "qwen2: null shape.");
 
-// 创建模型实例
-__export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(
-    const LlaisysQwen2Meta *meta, 
-    llaisysDeviceType_t device, 
-    int *device_ids, 
-    int ndevice) {
-    
-    if (!meta) {
-        std::cerr << "Error: meta is null in llaisysQwen2ModelCreate" << std::endl;
-        return nullptr;
-    }
-    
-    try {
-        return new LlaisysQwen2Model(*meta, device, device_ids, ndevice);
-    } catch (const std::exception& e) {
-        std::cerr << "Error creating Qwen2 model: " << e.what() << std::endl;
-        return nullptr;
-    } catch (...) {
-        std::cerr << "Unknown error creating Qwen2 model" << std::endl;
-        return nullptr;
-    }
+        const std::vector<size_t> shape_vec(shape, shape + ndim);
+        return model->load_weight(weight_name, data, shape_vec,
+                                  static_cast<llaisysDataType_t>(dtype));
+    });
 }
 
-// 销毁模型
-__export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model) {
-    if (model) {
-        delete model;
-    }
+__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids,
+                                        size_t ntoken) {
+    return llaisys::api::run("llaisysQwen2ModelInfer", static_cast<int64_t>(-1), [&]() {
+        CHECK_ARGUMENT(model != nullptr, "qwen2: model is null.");
+        return model->infer(token_ids, ntoken, 0.0f, 1, 1.0f, nullptr);
+    });
 }
 
-// 获取权重结构
-__export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model * model) {
-    if (!model) {
-        std::cerr << "Error: model is null in llaisysQwen2ModelWeights" << std::endl;
-        return nullptr;
-    }
-    return &(model->weights);
+__export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model *model,
+                                              int64_t *token_ids, size_t ntoken,
+                                              float temperature, size_t top_k, float top_p,
+                                              uint64_t *rng_state) {
+    return llaisys::api::run("llaisysQwen2ModelInferSample", static_cast<int64_t>(-1), [&]() {
+        CHECK_ARGUMENT(model != nullptr, "qwen2: model is null.");
+        CHECK_ARGUMENT(rng_state != nullptr, "qwen2: sampling needs a generator state.");
+        return model->infer(token_ids, ntoken, temperature, top_k, top_p, rng_state);
+    });
 }
 
-// 辅助函数：将权重名称映射到具体的权重位置
-static bool map_weight_to_location(LlaisysQwen2Model* model, 
-                                  const std::string& weight_name,
-                                  llaisysTensor_t*& target_tensor,
-                                  size_t* layer_idx = nullptr) {
-    
-    // 1. 嵌入层权重
-    if (weight_name == "model.embed_tokens.weight" || 
-        weight_name == "tok_embeddings.weight" ||
-        weight_name == "tok_embeddings") {
-        target_tensor = &(model->weights.in_embed);
-        return true;
-    }
-    
-    // 2. 输出层权重
-    if (weight_name == "lm_head.weight" || 
-        weight_name == "output.weight" ||
-        weight_name == "output") {
-        target_tensor = &(model->weights.out_embed);
-        return true;
-    }
-    
-    // 3. 输出归一化层
-    if (weight_name == "model.norm.weight" || 
-        weight_name == "norm.weight" ||
-        weight_name == "norm") {
-        target_tensor = &(model->weights.out_norm_w);
-        return true;
-    }
-    
-    // 4. 处理层权重（需要提取层号）
-    std::string pattern;
-    size_t layer_id = 0;
-    
-    // 尝试匹配层权重模式
-    if (weight_name.find("model.layers.") != std::string::npos) {
-        // 格式: model.layers.{layer}.{weight_name}
-        std::string prefix = "model.layers.";
-        size_t start = weight_name.find(prefix) + prefix.length();
-        size_t end = weight_name.find('.', start);
-        
-        if (end != std::string::npos) {
-            std::string layer_str = weight_name.substr(start, end - start);
-            try {
-                layer_id = std::stoi(layer_str);
-                pattern = weight_name.substr(end + 1);  // weight_name after layer
-            } catch (...) {
-                return false;
-            }
+__export void llaisysQwen2ModelReset(struct LlaisysQwen2Model *model) {
+    llaisys::api::run_void("llaisysQwen2ModelReset", [&]() {
+        if (model != nullptr) {
+            model->reset();
         }
-    }
-    
-    // 检查层号是否有效
-    if (layer_id >= model->meta.nlayer) {
-        std::cerr << "[ERROR] Layer index " << layer_id << " out of range (max=" 
-                  << model->meta.nlayer << ")" << std::endl;
-        return false;
-    }
-    
-    if (layer_idx) *layer_idx = layer_id;
-    
-    // 5. 映射权重名称
-    if (pattern.find("input_layernorm.weight") != std::string::npos ||
-        pattern == "attention_norm.weight") {
-        target_tensor = &(model->weights.attn_norm_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("self_attn.q_proj.weight") != std::string::npos ||
-             pattern.find("attention.wq.weight") != std::string::npos) {
-        target_tensor = &(model->weights.attn_q_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("self_attn.k_proj.weight") != std::string::npos ||
-             pattern.find("attention.wk.weight") != std::string::npos) {
-        target_tensor = &(model->weights.attn_k_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("self_attn.v_proj.weight") != std::string::npos ||
-             pattern.find("attention.wv.weight") != std::string::npos) {
-        target_tensor = &(model->weights.attn_v_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("self_attn.o_proj.weight") != std::string::npos ||
-             pattern.find("attention.wo.weight") != std::string::npos) {
-        target_tensor = &(model->weights.attn_o_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("post_attention_layernorm.weight") != std::string::npos ||
-             pattern.find("ffn_norm.weight") != std::string::npos) {
-        target_tensor = &(model->weights.mlp_norm_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("mlp.gate_proj.weight") != std::string::npos ||
-             pattern.find("feed_forward.w1.weight") != std::string::npos) {
-        target_tensor = &(model->weights.mlp_gate_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("mlp.up_proj.weight") != std::string::npos ||
-             pattern.find("feed_forward.w3.weight") != std::string::npos) {
-        target_tensor = &(model->weights.mlp_up_w[layer_id]);
-        return true;
-    }
-    else if (pattern.find("mlp.down_proj.weight") != std::string::npos ||
-             pattern.find("feed_forward.w2.weight") != std::string::npos) {
-        target_tensor = &(model->weights.mlp_down_w[layer_id]);
-        return true;
-    }
-    
-    return false;
-}
-
-// 主加载函数
-__export bool llaisysQwen2ModelLoadWeight(
-    struct LlaisysQwen2Model* model,
-    const char* weight_name,
-    const void* data,
-    const size_t* shape,
-    size_t ndim,
-    int dtype) {
-    
-    if (!model || !weight_name || !data) {
-        std::cerr << "[ERROR] Invalid parameters to llaisysQwen2ModelLoadWeight" << std::endl;
-        return false;
-    }
-    
-    std::string name_str(weight_name);
-    std::cout << "[LOAD] Loading weight: " << name_str 
-              << ", dtype=" << dtype 
-              << ", ndim=" << ndim << std::endl;
-    
-    // 打印形状信息
-    std::cout << "  Shape: [";
-    for (size_t i = 0; i < ndim; i++) {
-        std::cout << shape[i];
-        if (i < ndim - 1) std::cout << ", ";
-    }
-    std::cout << "]" << std::endl;
-    
-    try {
-        // 1. 映射权重名称到具体位置
-        llaisysTensor_t* target_tensor = nullptr;
-        size_t layer_idx = 0;
-        
-        if (!map_weight_to_location(model, name_str, target_tensor, &layer_idx)) {
-            std::cerr << "[ERROR] Could not map weight name: " << name_str << std::endl;
-            return false;
-        }
-        
-        // 2. 检查数据类型是否匹配
-        llaisysDataType_t  target_dtype = static_cast<llaisysDataType_t>(dtype);
-        if (target_dtype != model->meta.dtype) {
-            std::cout << "[WARN] Data type mismatch: weight=" << target_dtype 
-                      << ", model=" << model->meta.dtype 
-                      << ", converting..." << std::endl;
-            
-            // 这里需要实现类型转换逻辑
-            // 暂时只支持相同类型或float32->float16转换
-        }
-        
-        // 3. 创建张量
-        llaisysTensor_t new_tensor = tensorCreate(
-            const_cast<size_t*>(shape), ndim, target_dtype, 
-            model->device_type, model->device_id
-        );
-        
-        if (!new_tensor) {
-            std::cerr << "[ERROR] Failed to create tensor for weight: " << name_str << std::endl;
-            return false;
-        }
-        
-        // 4. 复制数据
-        size_t data_size = 1;
-        for (size_t i = 0; i < ndim; i++) {
-            data_size *= shape[i];
-        }
-        
-        // 计算字节大小
-        size_t elem_size = 0;
-        switch (target_dtype) {
-            case LLAISYS_DTYPE_F32: elem_size = 4; break;
-            case LLAISYS_DTYPE_F16: elem_size = 2; break;
-            case LLAISYS_DTYPE_BF16: elem_size = 2; break;
-            default: elem_size = 4; break;
-        }
-        
-        size_t total_bytes = data_size * elem_size;
-        
-        // 获取张量数据指针
-        void* tensor_data = tensorGetData(new_tensor);
-        if (!tensor_data) {
-            std::cerr << "[ERROR] Failed to get tensor data pointer" << std::endl;
-            tensorDestroy(new_tensor);
-            return false;
-        }
-        
-        // 复制数据
-        memcpy(tensor_data, data, total_bytes);
-        
-        std::cout << "  ✓ Data copied: " << total_bytes << " bytes" << std::endl;
-        
-        // 5. 替换旧的张量（如果存在）
-        if (*target_tensor) {
-            std::cout << "  Replacing existing tensor..." << std::endl;
-            tensorDestroy(*target_tensor);
-        }
-        
-        *target_tensor = new_tensor;
-        std::cout << "  ✓ Weight loaded successfully" << std::endl;
-        
-        return true;
-        
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Exception loading weight " << weight_name 
-                  << ": " << e.what() << std::endl;
-        return false;
-    } catch (...) {
-        std::cerr << "[ERROR] Unknown exception loading weight " << weight_name << std::endl;
-        return false;
-    }
-}
-
-// 推理函数 - 完整实现
-__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken) {
-    if (!model || !token_ids || ntoken == 0) {
-        std::cerr << "Error: invalid input to llaisysQwen2ModelInfer" << std::endl;
-        return -1;
-    }
-    
-    // 确定要处理的新token数量
-    size_t start_pos = model->current_seq_len;
-    size_t new_tokens = ntoken;
-    
-    if (start_pos > 0 && start_pos < ntoken) {
-        // 部分token已经处理过
-        new_tokens = ntoken - start_pos;
-        token_ids = &token_ids[start_pos];
-    } else if (start_pos >= ntoken) {
-        // 所有token都已经处理过
-        std::cout << "[Infer] All tokens already processed" << std::endl;
-        return 0; // 简化处理
-    }
-    
-    int64_t next_token = 0;
-    
-    // 处理新的token（一次处理一个，支持KV-Cache）
-    for (size_t pos_offset = 0; pos_offset < new_tokens; pos_offset++) {
-        size_t absolute_pos = start_pos + pos_offset;
-        int64_t token_id = token_ids[pos_offset];
-        
-        // 1. 嵌入查找
-        size_t index_shape[] = {1};
-        llaisysTensor_t index_tensor = tensorCreate(index_shape, 1, LLAISYS_DTYPE_I64,
-                                                   model->device_type, model->device_id);
-        
-        if (!index_tensor) {
-            std::cerr << "Error: Failed to create index tensor" << std::endl;
-            return -1;
-        }
-        
-        int64_t* index_data = static_cast<int64_t*>(tensorGetData(index_tensor));
-        index_data[0] = token_id;
-        
-        size_t embed_shape[] = {1, model->meta.hs};
-        llaisysTensor_t hidden = tensorCreate(embed_shape, 2, model->meta.dtype,
-                                             model->device_type, model->device_id);
-        
-        if (!hidden) {
-            std::cerr << "Error: Failed to create hidden tensor" << std::endl;
-            tensorDestroy(index_tensor);
-            return -1;
-        }
-        
-        if (!model->weights.in_embed) {
-            std::cerr << "Error: in_embed weight not loaded" << std::endl;
-            tensorDestroy(index_tensor);
-            tensorDestroy(hidden);
-            return -1;
-        }
-        
-        llaisysEmbedding(hidden, index_tensor, model->weights.in_embed);
-        tensorDestroy(index_tensor);
-        
-        // 2. 通过所有Transformer层
-        for (size_t layer = 0; layer < model->meta.nlayer; layer++) {
-            // 检查权重是否加载
-            if (!model->weights.attn_norm_w[layer] || !model->weights.attn_q_w[layer] ||
-                !model->weights.attn_k_w[layer] || !model->weights.attn_v_w[layer] ||
-                !model->weights.attn_o_w[layer] || !model->weights.mlp_norm_w[layer] ||
-                !model->weights.mlp_gate_w[layer] || !model->weights.mlp_up_w[layer] ||
-                !model->weights.mlp_down_w[layer]) {
-                std::cerr << "Error: weights not loaded for layer " << layer << std::endl;
-                tensorDestroy(hidden);
-                return -1;
-            }
-            
-            // 完整注意力层
-            apply_attention_layer(model, hidden, layer, absolute_pos, 1);
-            
-            // MLP层
-            apply_mlp_layer(model, hidden, layer, 1);
-        }
-        
-        // 3. 最终RMSNorm
-        size_t final_shape[] = {1, model->meta.hs};
-        llaisysTensor_t final_norm = tensorCreate(final_shape, 2, model->meta.dtype,
-                                                 model->device_type, model->device_id);
-        
-        if (!final_norm) {
-            std::cerr << "Error: Failed to create final_norm tensor" << std::endl;
-            tensorDestroy(hidden);
-            return -1;
-        }
-        
-        if (!model->weights.out_norm_w) {
-            std::cerr << "Error: out_norm_w not loaded" << std::endl;
-            tensorDestroy(hidden);
-            tensorDestroy(final_norm);
-            return -1;
-        }
-        
-        apply_rms_norm(final_norm, hidden, model->weights.out_norm_w, model->meta.epsilon);
-        tensorDestroy(hidden);
-        
-        // 4. 输出投影（LM Head）
-        size_t logits_shape[] = {1, model->meta.voc};
-        llaisysTensor_t logits = tensorCreate(logits_shape, 2, model->meta.dtype,
-                                             model->device_type, model->device_id);
-        
-        if (!logits) {
-            std::cerr << "Error: Failed to create logits tensor" << std::endl;
-            tensorDestroy(final_norm);
-            return -1;
-        }
-        
-        if (!model->weights.out_embed) {
-            std::cerr << "Error: out_embed not loaded" << std::endl;
-            tensorDestroy(final_norm);
-            tensorDestroy(logits);
-            return -1;
-        }
-        
-        llaisysLinear(logits, final_norm, model->weights.out_embed, nullptr);
-        tensorDestroy(final_norm);
-        
-        // 5. 使用argmax采样
-        size_t max_shape[] = {1};
-        llaisysTensor_t max_idx = tensorCreate(max_shape, 1, LLAISYS_DTYPE_I64,
-                                              model->device_type, model->device_id);
-        llaisysTensor_t max_val = tensorCreate(max_shape, 1, model->meta.dtype,
-                                              model->device_type, model->device_id);
-        
-        if (!max_idx || !max_val) {
-            std::cerr << "Error: Failed to create max_idx/max_val tensors" << std::endl;
-            tensorDestroy(logits);
-            if (max_idx) tensorDestroy(max_idx);
-            if (max_val) tensorDestroy(max_val);
-            return -1;
-        }
-        
-        llaisysArgmax(max_idx, max_val, logits);
-        
-        // 获取下一个token
-        int64_t* next_token_ptr = static_cast<int64_t*>(tensorGetData(max_idx));
-        next_token = next_token_ptr[0];
-        
-        // 清理
-        tensorDestroy(logits);
-        tensorDestroy(max_idx);
-        tensorDestroy(max_val);
-        
-        // 更新模型状态
-        model->current_seq_len = absolute_pos + 1;
-    }
-    
-    return next_token;
-}
-
-// 重置模型状态
-__export void llaisysQwen2ModelReset(struct LlaisysQwen2Model * model) {
-    if (!model) return;
-    
-    // 重置序列长度
-    model->current_seq_len = 0;
-    
-    // 重置KV-Cache位置
-    for (auto& cache : model->kv_cache) {
-        cache.current_pos = 0;
-    }
+    });
 }

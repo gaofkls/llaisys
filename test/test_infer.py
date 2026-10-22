@@ -60,7 +60,14 @@ def load_llaisys_model(model_path, device_name):
 
 
 def llaisys_infer(
-    prompt, tokenizer, model, max_new_tokens=128, top_p=0.8, top_k=50, temperature=0.8
+    prompt,
+    tokenizer,
+    model,
+    max_new_tokens=128,
+    top_p=0.8,
+    top_k=50,
+    temperature=0.8,
+    seed=None,
 ):
     input_content = tokenizer.apply_chat_template(
         conversation=[{"role": "user", "content": prompt}],
@@ -74,6 +81,7 @@ def llaisys_infer(
         top_k=top_k,
         top_p=top_p,
         temperature=temperature,
+        seed=seed,
     )
 
     return outputs, tokenizer.decode(outputs, skip_special_tokens=True)
@@ -88,6 +96,7 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", default=0.8, type=float)
     parser.add_argument("--top_k", default=50, type=int)
     parser.add_argument("--temperature", default=1.0, type=float)
+    parser.add_argument("--seed", default=None, type=int)
     parser.add_argument("--test", action="store_true")
 
     args = parser.parse_args()
@@ -132,6 +141,7 @@ if __name__ == "__main__":
         top_p=top_p,
         top_k=top_k,
         temperature=temperature,
+        seed=args.seed,
     )
 
     end_time = time.time()
