@@ -15,16 +15,33 @@ namespace {
 //   a' = a * cos(phi) - b * sin(phi)
 //   b' = b * cos(phi) + a * sin(phi)
 //   phi(j, p) = p / theta^(2j/d)
+//
+// Precision note (the reason this kernel is not simply "all double"): the angle is
+// built in float32, exactly like torch and HF do it --
+//
+//     freqs = positions.to(float32) / (theta ** (2i/d))     # float32 throughout
+//
+// That is not a cosmetic choice. phi grows with the position, so it is ~1e3 rad at
+// p = 1024, where one ulp of a float32 is 6.1e-5 rad. Computing phi in double
+// instead (mathematically "better") makes us disagree with the reference by up to
+// 8.8e-5 rad, which the rotation amplifies to ~1.1e-4 -- right at the 1e-4
+// tolerance of test/ops/rope.py, i.e. a test that fails on roughly one run in
+// three depending on the random draw. Matching the reference's own arithmetic
+// keeps the deviation at one ulp of phi (<= 6.2e-5 rad, so <= 8.6e-5 out) for
+// every input. Note cos/sin themselves are still evaluated in double and the
+// rotation accumulates in double, so no extra error is introduced beyond the
+// float32 quantisation the reference itself performs.
 template <typename T>
 void rope_kernel(T *out, const T *in, const int64_t *pos_ids, size_t seq_len,
                  size_t nhead, size_t d, float theta) {
     const size_t half = d / 2;
 
-    // Frequency table is shared, angles are per position.
-    std::vector<double> inv_freq(half);
+    // theta^(2j/d) is the divisor the reference divides by; pow() is evaluated in
+    // double and rounded once, which is the correctly rounded float32 value.
+    std::vector<float> divisor(half);
     for (size_t j = 0; j < half; ++j) {
-        inv_freq[j] = std::pow(static_cast<double>(theta),
-                               -2.0 * static_cast<double>(j) / static_cast<double>(d));
+        divisor[j] = static_cast<float>(
+            std::pow(static_cast<double>(theta), 2.0 * static_cast<double>(j) / d));
     }
 
     parallel_for(seq_len, 1, [&](size_t begin, size_t end) {
@@ -32,11 +49,11 @@ void rope_kernel(T *out, const T *in, const int64_t *pos_ids, size_t seq_len,
         std::vector<double> sin_tab(half);
 
         for (size_t i = begin; i < end; ++i) {
-            const double p = static_cast<double>(pos_ids[i]);
+            const float p = static_cast<float>(pos_ids[i]);
             for (size_t j = 0; j < half; ++j) {
-                const double angle = p * inv_freq[j];
-                cos_tab[j] = std::cos(angle);
-                sin_tab[j] = std::sin(angle);
+                const float angle = p / divisor[j]; // float32 division, as in the reference
+                cos_tab[j] = std::cos(static_cast<double>(angle));
+                sin_tab[j] = std::sin(static_cast<double>(angle));
             }
 
             const T *in_row = in + i * nhead * d;
