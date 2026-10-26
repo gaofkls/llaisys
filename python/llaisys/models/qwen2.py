@@ -137,7 +137,6 @@ class Qwen2:
         if not history:
             raise ValueError("generate() needs at least one prompt token")
 
-        generated: List[int] = []
         eos = self._native.meta.eos_token_id
 
         for _ in range(max_new_tokens):
@@ -149,12 +148,12 @@ class Qwen2:
                 )
             else:
                 next_token = self._native.infer_next_token(history)
+            # The eos token itself is kept: HF's generate() returns it as part of
+            # the sequence, and the acceptance test compares token lists exactly.
+            history.append(next_token)
             if next_token == eos:
                 break
-            generated.append(next_token)
-            history.append(next_token)
 
-        # history == prompt + generated, all plain Python ints
         return history
 
     def generate_text(self, prompt: str, max_new_tokens: Optional[int] = None) -> str:
