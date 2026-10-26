@@ -143,25 +143,46 @@ inline float _f16_to_f32(fp16_t val) {
 inline fp16_t _f32_to_f16(float val) {
     uint32_t f32;
     std::memcpy(&f32, &val, sizeof(f32));
-    const uint16_t sign = (f32 >> 16) & 0x8000;
-    const int32_t exponent = static_cast<int32_t>((f32 >> 23) & 0xFF) - 127;
-    uint32_t mantissa = f32 & 0x7FFFFF;
 
-    if (exponent >= 16) { // Inf / NaN / overflow
+    const uint16_t sign = static_cast<uint16_t>((f32 >> 16) & 0x8000u);
+    const uint32_t magnitude = f32 & 0x7FFFFFFFu;
+    const int32_t exponent = static_cast<int32_t>(magnitude >> 23) - 127; // unbiased
+    const uint32_t mantissa = magnitude & 0x7FFFFFu;
+
+    if (exponent > 15) { // does not fit in fp16: overflow to infinity, keep NaN
         if (exponent == 128 && mantissa != 0) {
-            return fp16_t{static_cast<uint16_t>(sign | 0x7E00)};
+            return fp16_t{static_cast<uint16_t>(sign | 0x7E00u)};
         }
-        return fp16_t{static_cast<uint16_t>(sign | 0x7C00)};
+        return fp16_t{static_cast<uint16_t>(sign | 0x7C00u)};
     }
-    if (exponent >= -14) { // Normalised
-        return fp16_t{static_cast<uint16_t>(sign | ((exponent + 15) << 10) | (mantissa >> 13))};
+
+    // Round to nearest, ties to even. Truncating instead (what this used to do)
+    // biases every result towards zero by up to one ulp, i.e. by 2.4e-4 relative
+    // for a value around one -- enough to fail a 1e-3 comparison against a
+    // reference that rounds.
+    if (exponent >= -14) { // normal fp16 result: 13 mantissa bits are dropped
+        const uint32_t kept = mantissa >> 13;
+        const uint32_t dropped = mantissa & 0x1FFFu;
+        const uint32_t round_up =
+            (dropped > 0x1000u) || (dropped == 0x1000u && (kept & 1u) != 0);
+        // The carry out of the mantissa propagates into the exponent field, which
+        // is exactly the IEEE result (and yields infinity past the largest value).
+        const uint32_t bits = ((static_cast<uint32_t>(exponent + 15) << 10) | kept) + round_up;
+        return fp16_t{static_cast<uint16_t>(sign | bits)};
     }
-    if (exponent >= -24) { // Subnormal
-        mantissa |= 0x800000;
-        mantissa >>= (-14 - exponent);
-        return fp16_t{static_cast<uint16_t>(sign | (mantissa >> 13))};
+
+    if (exponent >= -25) { // subnormal fp16 result
+        const uint32_t m = mantissa | 0x800000u; // implicit leading one
+        const uint32_t shift = 13u + static_cast<uint32_t>(-14 - exponent);
+        const uint32_t kept = m >> shift;
+        const uint32_t dropped = m & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1u);
+        const uint32_t round_up =
+            (dropped > halfway) || (dropped == halfway && (kept & 1u) != 0);
+        return fp16_t{static_cast<uint16_t>(sign | (kept + round_up))};
     }
-    return fp16_t{static_cast<uint16_t>(sign)};
+
+    return fp16_t{static_cast<uint16_t>(sign)}; // underflows to signed zero
 }
 
 inline float _bf16_to_f32(bf16_t val) {

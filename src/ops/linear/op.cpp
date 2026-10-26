@@ -9,6 +9,13 @@ namespace llaisys::ops {
 
 namespace {
 
+// Tile sizes for the prefill GEMM. They live at namespace scope on purpose: MSVC
+// rejects a function-local constexpr used as an array bound inside a lambda
+// ("expression did not evaluate to a constant", C2131), because `[&]` makes the
+// capture non-constant from its point of view.
+constexpr size_t kTileRows = 4;
+constexpr size_t kTileCols = 4;
+
 // out[0, N] = in[0, K] @ weight[N, K]^T + bias[N]
 //
 // Decoding is a matrix-vector product, and it is memory bound: the weight matrix
@@ -55,19 +62,17 @@ void gemv_kernel(T *out, const T *in, const T *weight, const T *bias, size_t K, 
 template <typename T>
 void linear_kernel(T *out, const T *in, const T *weight, const T *bias, size_t M,
                    size_t K, size_t N) {
-    constexpr size_t TM = 4;
-    constexpr size_t TN = 4;
-    const size_t mtiles = (M + TM - 1) / TM;
-    const size_t ntiles = (N + TN - 1) / TN;
+    const size_t mtiles = (M + kTileRows - 1) / kTileRows;
+    const size_t ntiles = (N + kTileCols - 1) / kTileCols;
 
     auto compute_tile = [&](size_t m0, size_t n0) {
-        const size_t rows = std::min(TM, M - m0);
-        const size_t cols = std::min(TN, N - n0);
-        float acc[TM][TN] = {};
+        const size_t rows = std::min(kTileRows, M - m0);
+        const size_t cols = std::min(kTileCols, N - n0);
+        float acc[kTileRows][kTileCols] = {};
 
         const T *x = in + m0 * K;
         for (size_t k = 0; k < K; ++k) {
-            float xv[TM];
+            float xv[kTileRows];
             for (size_t r = 0; r < rows; ++r) {
                 xv[r] = to_float(x[r * K + k]);
             }
@@ -92,12 +97,12 @@ void linear_kernel(T *out, const T *in, const T *weight, const T *bias, size_t M
         }
     };
 
-    if (M <= TM) {
+    if (M <= kTileRows) {
         // Token-by-token decoding: a single row of activations, so parallelise
         // across output features instead (otherwise there is nothing to split).
         parallel_for(ntiles, 8, [&](size_t begin, size_t end) {
             for (size_t n0 = begin; n0 < end; ++n0) {
-                compute_tile(0, n0 * TN);
+                compute_tile(0, n0 * kTileCols);
             }
         });
     } else {
@@ -106,7 +111,7 @@ void linear_kernel(T *out, const T *in, const T *weight, const T *bias, size_t M
         parallel_for(mtiles, 1, [&](size_t begin, size_t end) {
             for (size_t m0 = begin; m0 < end; ++m0) {
                 for (size_t n0 = 0; n0 < ntiles; ++n0) {
-                    compute_tile(m0 * TM, n0 * TN);
+                    compute_tile(m0 * kTileRows, n0 * kTileCols);
                 }
             }
         });

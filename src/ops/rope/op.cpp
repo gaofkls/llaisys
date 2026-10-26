@@ -41,7 +41,8 @@ void rope_kernel(T *out, const T *in, const int64_t *pos_ids, size_t seq_len,
     std::vector<float> divisor(half);
     for (size_t j = 0; j < half; ++j) {
         divisor[j] = static_cast<float>(
-            std::pow(static_cast<double>(theta), 2.0 * static_cast<double>(j) / d));
+            std::pow(static_cast<double>(theta),
+                     2.0 * static_cast<double>(j) / static_cast<double>(d)));
     }
 
     parallel_for(seq_len, 1, [&](size_t begin, size_t end) {
